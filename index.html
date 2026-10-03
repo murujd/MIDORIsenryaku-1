@@ -1,0 +1,2319 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0">
+<title>堺市 みんなの農業ひろば</title>
+
+<!--
+  ▼▼▼ ここから：外部サービス（Supabase / Cloudflare R2）の設定 ▼▼▼
+  このサイトを「みんなで共有できる掲示板」として公開するには、無料のSupabaseプロジェクトと、
+  写真・動画の保存用にCloudflare R2（＋簡単なCloudflare Worker）が必要です。
+
+  【Supabase（データベース）の手順】
+   1. https://supabase.com/ で無料アカウント・新しいプロジェクトを作成する
+   2. 左メニューの「SQL Editor」で、次のSQLを実行してテーブルを作る：
+
+      create table kv_store (
+        key text primary key,
+        value jsonb
+      );
+      alter table kv_store enable row level security;
+
+      -- 閲覧（読み取り）は登録なしでも誰でもできるようにする
+      create policy "kv anyone can read" on kv_store
+        for select using (true);
+
+      -- 書き込み（投稿・いいね・広告の掲載など）は、ログインしている人だけができるようにする
+      -- （ここが空欄だと、ログインしていない見知らぬ人でも書き換えができてしまいます）
+      create policy "kv only logged in can write" on kv_store
+        for insert with check (auth.role() = 'authenticated');
+      create policy "kv only logged in can update" on kv_store
+        for update using (auth.role() = 'authenticated') with check (auth.role() = 'authenticated');
+
+      ※ これにより、少なくとも「ログイン（会員登録）していない人」からの書き換えは防げます。
+      ※ ただし、この掲示板はデータをまとめて1行に保存する簡易な作りのため、
+        「ログイン済みの誰か」が投稿を消したり書き換えたりすること自体は、
+        アプリの画面（削除ボタンの出し分けなど）では防いでいますが、データベースの
+        ルールだけでは完全には防げません。より厳密に守りたい場合は、投稿を1件ずつ
+        別々の行として保存する作りに変更する必要があります（ご希望であれば対応します）。
+
+   3. 左メニューの「Project Settings」→「API」を開き、
+      「Project URL」と「anon public」キー（publishable key）を、下の設定欄にコピーする
+
+  【ログイン機能について】
+   このサイトはSupabaseの「Authentication」機能を使ったログインを備えています。
+   Supabaseプロジェクトを作成すると、メール・パスワードでのログインは最初から使える状態になっています。
+   デフォルトでは、新規登録時に確認メールが届く設定になっています。
+   すぐに試したい場合は、左メニューの「Authentication」→「Providers」→「Email」で
+   「Confirm email」をオフにすると、確認メールなしでそのまま使えるようになります（あとで戻せます）。
+
+  【管理者の設定（不適切な投稿を削除できる人）】
+   1. 管理者にしたい人が、先に通常どおり新規登録しておく
+   2. Supabaseの「SQL Editor」で、下のSQLのメールアドレスを書き換えて実行する
+        update auth.users
+        set raw_app_meta_data = coalesce(raw_app_meta_data, '{}'::jsonb) || '{"role":"admin"}'::jsonb
+        where email = 'kanrisha@example.com';
+   3. その人が一度ログアウトして、もう一度ログインする
+      → 画面上部の名前の横に「（管理者）」と出て、他の人の投稿・回答・広告に
+        「削除（管理者）」ボタンが表示されます（一般の利用者には表示されません）
+   ※ この「role」は利用者本人が画面や設定から書き換えることはできません。
+   ※ 管理者を外すときは、上のSQLの代わりに次を実行します。
+        update auth.users set raw_app_meta_data = raw_app_meta_data - 'role' where email = 'kanrisha@example.com';
+   ※ 注意：上の【Supabaseの手順】でデータベースのルールを設定していれば、
+      「ログインしていない人」からの書き換えは防げます。ただし、削除ボタンの出し分け自体は
+      画面（アプリ）側の仕組みのため、ログイン済みの技術に詳しい人が専用の方法で直接データを
+      操作すること（自分以外の投稿を消すなど）までは、完全には防げません。より厳密にしたい
+      場合は、投稿を1件ずつ別々の行として保存し、削除にも権限チェックを行う作りに変更する
+      必要があります（ご希望であれば対応します）。
+
+  【Cloudflare R2 + Worker（写真・動画の保存）の手順】
+   1. https://dash.cloudflare.com/ で無料アカウントを作成する
+   2. 左メニューの「R2」からバケットを1つ作成する（例：sakai-uploads）
+   3. 作成したバケットの「設定」→「パブリックアクセス」を有効にし、
+      表示される公開URL（例：https://pub-xxxxxxxx.r2.dev）を控えておく
+   4. 「Workers」から新しいWorkerを作成し、下記のコードを貼り付けて保存・デプロイする：
+
+      export default {
+        async fetch(request, env) {
+          const cors = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+          };
+          if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+          if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: cors });
+          try {
+            const form = await request.formData();
+            const file = form.get("file");
+            if (!file) return new Response(JSON.stringify({error:"no file"}), { status:400, headers:{...cors,"Content-Type":"application/json"} });
+            const ext = (file.name && file.name.split('.').pop()) || 'bin';
+            const key = crypto.randomUUID() + '.' + ext;
+            await env.SAKAI_BUCKET.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+            const publicUrl = env.PUBLIC_BASE_URL.replace(/\/$/,'') + '/' + key;
+            return new Response(JSON.stringify({ url: publicUrl }), { headers: {...cors, "Content-Type":"application/json"} });
+          } catch (e) {
+            return new Response(JSON.stringify({error: String(e)}), { status:500, headers:{...cors,"Content-Type":"application/json"} });
+          }
+        }
+      }
+
+   5. そのWorkerの「設定」→「変数とシークレット」で、
+       ・「R2バケットのバインディング」を追加：変数名 SAKAI_BUCKET → 作成したバケットを選択
+       ・環境変数 PUBLIC_BASE_URL に、手順3で控えた公開URLを設定
+   6. Workerの画面に表示される、Worker自体のURL（例：https://xxxx.yyyy.workers.dev）を
+      下の設定欄にコピーする
+
+  設定を入れるまでは、この端末だけに保存する簡易モードで動作します。
+-->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  // ここに、ご自身のSupabaseプロジェクトの設定値を入れてください
+  window.SAKAI_SUPABASE_CONFIG = {
+    url: "https://YOUR_PROJECT_REF.supabase.co",
+    key: "YOUR_ANON_PUBLIC_KEY"
+  };
+  // ここに、ご自身のCloudflare Worker（R2アップロード用）のURLを入れてください
+  window.SAKAI_R2_CONFIG = {
+    uploadUrl: "YOUR_WORKER_URL"
+  };
+</script>
+<!-- ▲▲▲ ここまで：外部サービス（Supabase / Cloudflare R2）の設定 ▲▲▲ -->
+<style>
+  :root{
+    --soil: #5B4230;
+    --soil-dark: #3E2C1F;
+    --leaf: #3F7A4E;
+    --leaf-dark: #2C5A38;
+    --sand: #FBF6EA;
+    --sand-deep: #F1E8D4;
+    --sun: #E3A335;
+    --sun-dark: #C6841C;
+    --ink: #2B2620;
+    --line: #E1D5B8;
+    --white: #FFFFFF;
+    --danger:#B4472B;
+  }
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{
+    margin:0;
+    font-family: "Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic",sans-serif;
+    background:var(--sand);
+    color:var(--ink);
+    line-height:1.7;
+    font-size:17px;
+    padding-bottom:90px;
+  }
+  h1,h2,h3{ font-family:"Hiragino Mincho ProN","Yu Mincho",serif; margin:0 0 8px; color:var(--soil-dark); }
+  .post-title{ font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic",sans-serif; font-weight:bold; }
+
+  header.top{
+    background: linear-gradient(135deg,var(--leaf) 0%, var(--leaf-dark) 100%);
+    color:var(--white);
+    padding:18px 16px 22px;
+    position:relative;
+    overflow:hidden;
+  }
+  header.top::after{
+    content:"";
+    position:absolute; right:-30px; bottom:-40px;
+    width:160px;height:160px;border-radius:50%;
+    background:rgba(255,255,255,0.08);
+  }
+  header.top .eyebrow{ font-size:13px; letter-spacing:0.12em; opacity:0.85; }
+  header.top h1{ color:var(--white); font-size:26px; margin:2px 0 0; }
+  .userbar{ display:flex; align-items:center; justify-content:space-between; margin-top:12px; font-size:15px; }
+  .userbar .name{ background:rgba(255,255,255,0.18); padding:6px 14px; border-radius:20px; }
+  .userbar button{ background:var(--sun); border:none; color:var(--soil-dark); padding:6px 12px; border-radius:20px; font-weight:bold; font-size:14px; }
+
+  #authScreen{
+    min-height:100vh; display:flex; align-items:center; justify-content:center;
+    background:linear-gradient(135deg,var(--leaf) 0%, var(--leaf-dark) 100%);
+    padding:24px 16px;
+  }
+  .auth-wrap{ width:100%; max-width:420px; }
+  .auth-wrap .eyebrow, .auth-wrap h1{ color:var(--white) !important; text-align:center; }
+  #authError .notice-limit{ background:#FCEAE6; border-color:#E7B8AC; color:#7A2E1A; margin-top:10px; margin-bottom:0; }
+
+  .layout{
+    display:flex;
+    align-items:flex-start;
+    max-width:720px;
+    margin:0 auto;
+    width:100%;
+  }
+
+  nav.tabs{
+    flex:0 0 auto;
+    width:78px;
+    display:flex; flex-direction:column; gap:6px;
+    background:var(--sand-deep);
+    padding:10px 6px;
+    position:sticky; top:0; z-index:50;
+    border-right:2px solid var(--line);
+    min-height:100vh;
+  }
+  nav.tabs button{
+    border:2px solid transparent; background:var(--white); color:var(--soil-dark);
+    padding:10px 4px; border-radius:12px; font-size:12.5px; line-height:1.3; font-weight:bold;
+    cursor:pointer; text-align:center; word-break:keep-all;
+  }
+  nav.tabs button.active{ background:var(--leaf); color:var(--white); border-color:var(--leaf-dark); box-shadow:0 2px 6px rgba(44,90,56,0.35); }
+
+  main{ flex:1 1 auto; min-width:0; padding:16px 12px; }
+  section.view{ display:none; animation:fade .25s ease; }
+  section.view.active{ display:block; }
+  @keyframes fade{ from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:none;} }
+
+  .card{
+    background:var(--white); border:1px solid var(--line); border-radius:16px;
+    padding:16px; margin-bottom:14px; box-shadow: 0 2px 6px rgba(59,45,25,0.06);
+  }
+  .card h3{ font-size:19px; }
+  .card.tap{ cursor:pointer; }
+  .card.tap:active{ background:var(--sand-deep); }
+
+  .btn{
+    display:inline-block; background:var(--leaf); color:var(--white); border:none; padding:12px 18px;
+    border-radius:12px; font-size:16px; font-weight:bold; cursor:pointer; text-align:center;
+  }
+  .btn.wide{ width:100%; }
+  .btn.sun{ background:var(--sun); color:var(--soil-dark); }
+  .btn.outline{ background:var(--white); color:var(--leaf-dark); border:2px solid var(--leaf); }
+  .btn.small{ padding:6px 12px; font-size:14px; border-radius:10px; }
+  .btn.danger{ background:var(--danger); }
+
+  input[type=file]{ padding:8px; font-size:14px; }
+  .img-preview-wrap{ position:relative; display:inline-block; margin:4px 6px 4px 0; }
+  .img-preview-wrap img{ width:82px; height:82px; object-fit:cover; border-radius:12px; border:1px solid var(--line); display:block; }
+  .img-preview-wrap button{
+    position:absolute; top:6px; right:6px; background:rgba(40,30,15,0.7); color:var(--white);
+    border:none; border-radius:50%; width:26px; height:26px; font-size:15px; cursor:pointer;
+  }
+  .post-image{ max-width:100%; border-radius:12px; margin-top:8px; display:block; border:1px solid var(--line); }
+  .post-images{ display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .post-images img{ width:calc(50% - 3px); aspect-ratio:1; object-fit:cover; border-radius:12px; border:1px solid var(--line); }
+  .warn-pill{ display:inline-block; font-size:12px; padding:3px 10px; border-radius:20px; background:#FCEAE6; color:#B4472B; font-weight:bold; margin-left:4px; }
+  .nav-dot{ display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--danger); margin-left:4px; vertical-align:top; }
+  .announce-card{ border-left:6px solid var(--sun-dark); background:var(--white); border-top:1px solid var(--line); border-right:1px solid var(--line); border-bottom:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:12px; }
+  .announce-card .announce-title{ font-weight:bold; font-size:16px; }
+  .stock-manager{ margin-top:10px; padding:10px 12px; background:var(--sand); border-radius:12px; border:1px solid var(--line); }
+  .stock-manager label{ margin:0 0 6px; }
+  .btn:disabled{ opacity:0.5; }
+
+  label{ display:block; font-weight:bold; margin:12px 0 4px; font-size:15px; color:var(--soil-dark); }
+  input[type=text],input[type=date],input[type=number],select,textarea{
+    width:100%; padding:11px; border:2px solid var(--line); border-radius:10px;
+    font-size:16px; font-family:inherit; background:var(--white); color:var(--ink);
+  }
+  textarea{ min-height:110px; resize:vertical; }
+  .hint{ font-size:13px; color:#7A6B52; margin-top:2px; }
+
+  .pill{
+    display:inline-block; font-size:12px; padding:3px 10px; border-radius:20px;
+    background:var(--sand-deep); color:var(--soil-dark); font-weight:bold; margin-right:6px;
+  }
+  .pill.q{ background:#E7F0E9; color:var(--leaf-dark); }
+  .pill.a{ background:#FCE9D8; color:var(--sun-dark); }
+
+  .meta{ font-size:13px; color:#8A7C63; margin-top:6px; }
+  .like-row{ display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap; }
+  .like-btn{
+    border:2px solid var(--sun-dark); background:var(--white); color:var(--sun-dark);
+    padding:6px 14px; border-radius:20px; font-size:15px; font-weight:bold; cursor:pointer;
+  }
+  .like-btn.liked{ background:var(--sun); color:var(--white); }
+  .points-tag{ font-size:13px; color:var(--leaf-dark); font-weight:bold; }
+  .view-tag{ font-size:13px; color:#8A7C63; }
+  .del-btn{ border:none; background:none; color:var(--danger); font-size:14px; font-weight:bold; cursor:pointer; margin-left:auto; }
+
+  .snippet{ color:#5B4E3A; }
+
+  .answer{ margin-top:12px; padding:12px; background:var(--sand); border-radius:12px; border:1px solid var(--line); }
+  .answer-form{ margin-top:10px; }
+
+  .fab{
+    position:fixed; right:18px; bottom:18px; z-index:60;
+    background:var(--sun); color:var(--soil-dark);
+    width:64px; height:64px; border-radius:50%;
+    border:none; font-size:30px; box-shadow:0 4px 12px rgba(0,0,0,0.25);
+    cursor:pointer;
+  }
+
+  .modal-bg{
+    display:none; position:fixed; inset:0; background:rgba(40,30,15,0.5);
+    z-index:100; align-items:flex-end; justify-content:center;
+  }
+  .modal-bg.active{ display:flex; }
+  .modal{
+    background:var(--sand); width:100%; max-width:720px; max-height:88vh; overflow-y:auto;
+    border-radius:20px 20px 0 0; padding:20px;
+  }
+  .modal h2{ display:flex; justify-content:space-between; align-items:center; }
+  .close-x{ background:none; border:none; font-size:26px; color:var(--soil); cursor:pointer; }
+
+  .type-choice{ display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+  .type-choice button{
+    flex:1; min-width:100px; padding:12px; border-radius:12px; border:2px solid var(--line);
+    background:var(--white); font-size:15px; font-weight:bold; cursor:pointer; color:var(--soil);
+  }
+  .type-choice button.sel{ border-color:var(--leaf); background:#E7F0E9; color:var(--leaf-dark); }
+
+  .crop-chip{
+    display:inline-flex; align-items:center; gap:6px;
+    background:var(--white); border:1px solid var(--line); border-radius:20px;
+    padding:8px 14px; margin:4px 6px 4px 0;
+  }
+  .crop-chip button{ background:none; border:none; color:var(--danger); font-size:16px; cursor:pointer; }
+
+  .ward-chip{
+    background:var(--white); border:2px solid var(--line); color:var(--soil);
+    border-radius:20px; padding:7px 14px; font-size:14px; font-weight:bold; cursor:pointer;
+  }
+  .ward-chip.sel{ background:var(--leaf); border-color:var(--leaf-dark); color:var(--white); }
+
+  .cal-grid{
+    display:grid; grid-template-columns:repeat(7,1fr); gap:0; text-align:center;
+    border-top:1px solid var(--line); border-left:1px solid var(--line); border-radius:8px; overflow:hidden;
+  }
+  .cal-grid .dow{ font-size:12px; color:#8A7C63; font-weight:bold; padding:4px 0; background:var(--sand-deep); border-right:1px solid var(--line); border-bottom:1px solid var(--line); }
+  .cal-grid .dow.sat{ color:#3E7FB0; }
+  .cal-grid .dow.sun{ color:var(--danger); }
+  .cal-cell{
+    background:var(--white); border-right:1px solid var(--line); border-bottom:1px solid var(--line);
+    min-height:58px; padding:3px 0 4px; font-size:12px; position:relative; cursor:pointer;
+    display:flex; flex-direction:column; align-items:stretch;
+  }
+  .cal-cell .d{ font-weight:bold; font-size:12px; text-align:center; margin-bottom:2px; }
+  .cal-cell .d.sat{ color:#3E7FB0; }
+  .cal-cell .d.sun{ color:var(--danger); }
+  .cal-cell.today{ background:var(--sand-deep); }
+  .cal-cell.today .d{ display:inline-block; background:var(--sun); color:var(--white); border-radius:50%; width:20px; height:20px; line-height:20px; margin:0 auto 2px; }
+  .cal-cell.outside{ background:var(--sand); }
+  .cal-cell.outside .d{ color:#C4B79A; }
+  .cal-cell.outside .d.sat{ color:#9DBBD1; }
+  .cal-cell.outside .d.sun{ color:#E0AFA4; }
+  .cal-cell:active{ background:var(--sand-deep); }
+  .cal-badges{ display:flex; flex-direction:column; gap:2px; width:100%; }
+  .cal-badge{
+    color:var(--white); font-size:9.5px; line-height:1.5; font-weight:bold;
+    padding:0 2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .cal-badge.seg-solo{ border-radius:4px; margin:0 2px; }
+  .cal-badge.seg-start{ border-radius:4px 0 0 4px; margin:0 0 0 2px; }
+  .cal-badge.seg-mid{ border-radius:0; margin:0; text-align:left; padding-left:2px; }
+  .cal-badge.seg-end{ border-radius:0 4px 4px 0; margin:0 2px 0 0; }
+  .cal-more{ font-size:9.5px; color:#8A7C63; text-align:center; margin-top:1px; }
+  .cal-legend{ display:flex; flex-wrap:wrap; gap:8px 14px; margin-top:12px; }
+  .cal-legend .li{ display:flex; align-items:center; gap:5px; font-size:12px; color:#5B4E3A; }
+  .cal-legend .sw{ width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .ev-card{ border-left-width:6px; border-left-style:solid; background:var(--white); border-top:1px solid var(--line); border-right:1px solid var(--line); border-bottom:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:10px; }
+  .ev-card .ev-title{ font-weight:bold; font-size:16px; }
+  .ev-card .ev-time{ font-size:13px; color:#8A7C63; }
+
+  .timeline{ display:flex; flex-direction:column; }
+  .tl-item{ display:flex; gap:10px; }
+  .tl-time{ width:48px; flex:0 0 auto; font-size:12.5px; font-weight:bold; color:#5B4E3A; padding-top:3px; text-align:right; }
+  .tl-line{ flex:0 0 auto; width:14px; display:flex; justify-content:center; position:relative; }
+  .tl-dot{ width:11px; height:11px; border-radius:50%; margin-top:4px; flex:0 0 auto; border:2px solid var(--white); box-shadow:0 0 0 1px var(--line); }
+  .tl-item:not(:last-child) .tl-line::after{ content:''; position:absolute; top:15px; bottom:-16px; width:2px; background:var(--line); left:50%; transform:translateX(-50%); }
+  .tl-content{ flex:1; min-width:0; padding-bottom:18px; }
+  .tl-title{ font-weight:bold; font-size:15px; }
+  .tl-note{ font-size:13px; color:#5B4E3A; margin-top:2px; }
+  .tl-del{ margin-top:4px; }
+
+  .sched-item{ display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
+
+  .ai-bubble{ background:#EAF3EC; border-radius:14px; padding:12px; margin-top:10px; white-space:pre-wrap; font-size:15px; }
+  .loading{ color:#8A7C63; font-size:14px; }
+
+  .empty-state{ text-align:center; color:#8A7C63; padding:30px 10px; }
+
+  .notice-limit{
+    font-size:13px; background:#FFF6E5; border:1px solid #F0DDA6; color:#7A5A12;
+    padding:10px 12px; border-radius:10px; margin-bottom:14px;
+  }
+
+  .rank-section{ margin-bottom:18px; }
+  .rank-section h3{ font-size:16px; border-left:4px solid var(--sun); padding-left:8px; }
+  .rank-card{ background:var(--white); border:1px solid var(--line); border-radius:14px; padding:12px 14px; margin-bottom:8px; }
+  .rank-card .rtitle{ font-weight:bold; font-size:16px; font-family:"Hiragino Maru Gothic ProN","BIZ UDPGothic","Yu Gothic",sans-serif; }
+  .rank-num{ display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:var(--leaf); color:var(--white); font-size:13px; font-weight:bold; margin-right:6px; }
+
+  ::selection{ background:var(--sun); color:var(--white); }
+  button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible{
+    outline:3px solid var(--sun-dark); outline-offset:1px;
+  }
+</style>
+</head>
+<body>
+
+<!-- ログイン画面 -->
+<div id="authScreen" style="display:none;">
+  <div class="auth-wrap">
+    <div class="eyebrow" style="color:var(--soil-dark);">大阪府 堺市</div>
+    <h1 style="color:var(--soil-dark);">みんなの農業ひろば</h1>
+    <div class="card" style="margin-top:16px;">
+      <div class="type-choice">
+        <button type="button" id="authTabLogin" class="sel">ログイン</button>
+        <button type="button" id="authTabSignup">はじめての方（新規登録）</button>
+      </div>
+      <div id="authSignupNameField" style="display:none;">
+        <label>表示する名前</label>
+        <input type="text" id="authDisplayName" placeholder="例：山田さん、〇〇農園">
+      </div>
+      <label>メールアドレス</label>
+      <input type="text" id="authEmail" placeholder="example@mail.com">
+      <label>パスワード（6文字以上）</label>
+      <input type="password" id="authPassword" placeholder="パスワード">
+      <div id="authTermsField" style="display:none; margin-top:12px;">
+        <label style="display:flex; align-items:flex-start; gap:8px; font-weight:normal;">
+          <input type="checkbox" id="authTermsCheck" style="width:20px; height:20px; margin-top:2px;">
+          <span><button type="button" id="openTermsFromAuth" class="btn small outline" style="padding:4px 10px;">利用規約</button> に同意します</span>
+        </label>
+      </div>
+      <div id="authError"></div>
+      <button class="btn wide sun" id="authSubmitBtn" style="margin-top:12px;">ログインする</button>
+      <p class="hint" style="margin-top:10px;">新規登録の場合、確認メールが届くことがあります。メール内のリンクを開くとログインできるようになります。</p>
+      <button class="btn wide outline" id="authBackToBrowseBtn" style="margin-top:10px;">登録せずに閲覧に戻る</button>
+    </div>
+  </div>
+</div>
+
+<div id="appRoot" style="display:none;">
+<header class="top">
+  <div class="eyebrow">大阪府 堺市</div>
+  <h1>みんなの農業ひろば</h1>
+  <div class="userbar">
+    <span class="name" id="userNameDisplay">ようこそ、ゲストさん</span>
+  </div>
+</header>
+
+<div id="storageModeBanner"></div>
+<div id="announceBanner"></div>
+<div class="layout">
+<nav class="tabs" id="tabs">
+  <button data-view="announce">お知らせ<span id="announceDot" class="nav-dot" style="display:none;"></span></button>
+  <button data-view="ads" class="active">広告</button>
+  <button data-view="board">掲示板</button>
+  <button data-view="crops">作物</button>
+  <button data-view="calendar">カレンダー</button>
+  <button data-view="mypage">マイページ</button>
+</nav>
+
+<main>
+
+  <!-- 掲示板 -->
+  <section class="view" id="view-board">
+    <div id="rankingBox"></div>
+
+    <div class="card" style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn small outline filter-btn sel" data-filter="all">すべて</button>
+      <button class="btn small outline filter-btn" data-filter="question">質問・相談</button>
+      <button class="btn small outline filter-btn" data-filter="article">記事</button>
+    </div>
+    <div id="postList"></div>
+  </section>
+
+  <!-- 作物 -->
+  <section class="view" id="view-crops">
+    <div class="card">
+      <h3>育てている作物を登録</h3>
+      <label>作物の名前</label>
+      <input type="text" id="cropName" placeholder="例：水なす、玉ねぎ、みかん">
+      <label>植え付け（または今の生育）状況のメモ</label>
+      <textarea id="cropNote" placeholder="例：先月苗を植えた。最近葉に虫がついている、など"></textarea>
+      <button class="btn wide" id="addCropBtn" style="margin-top:12px;">登録する</button>
+    </div>
+    <div class="card">
+      <h3>登録中の作物</h3>
+      <div id="cropChips"></div>
+    </div>
+  </section>
+
+  <!-- カレンダー -->
+  <section class="view" id="view-calendar">
+    <div class="notice-limit">
+      このカレンダーはあなただけが見られる、個人用の予定表です。他の人には表示されません。
+    </div>
+    <div class="card">
+      <h3>今日の行動スケジュール</h3>
+      <div id="todayTimeline"></div>
+    </div>
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <button class="btn small outline" id="prevMonthBtn">◀ 前の月</button>
+        <h3 id="calTitle" style="margin:0;"></h3>
+        <button class="btn small outline" id="nextMonthBtn">次の月 ▶</button>
+      </div>
+      <button class="btn small sun wide" id="todayBtn" style="margin-bottom:10px;">今日に戻る</button>
+      <div class="cal-grid" id="calGrid"></div>
+      <div class="cal-legend" id="calLegend"></div>
+    </div>
+    <div class="card">
+      <h3>これからの予定</h3>
+      <div id="schedList"></div>
+    </div>
+    <div class="card">
+      <h3>毎日のスケジュール</h3>
+      <p class="hint">「水やり」「見回り」など、毎日くり返す用事はここに登録すると、毎日の予定として自動で表示されます。</p>
+      <div id="routineList"></div>
+      <label>時刻（分かれば）</label>
+      <input type="text" id="routineTime" placeholder="例：7:00（空欄でも大丈夫です）">
+      <label>種類（自由に名前を決められます）</label>
+      <input type="text" id="routineCategory" placeholder="例：水やり、見回り など">
+      <div id="routineCategoryChips"></div>
+      <label>内容</label>
+      <input type="text" id="routineTitle" placeholder="例：畑の水やり">
+      <label>メモ（あれば）</label>
+      <textarea id="routineNote" placeholder="やり方や注意点など、あれば"></textarea>
+      <button class="btn wide" id="addRoutineBtn" style="margin-top:12px;">毎日の予定として登録する</button>
+    </div>
+  </section>
+
+  <!-- 日付ごとの予定モーダル -->
+  <div class="modal-bg" id="dayModalBg">
+    <div class="modal">
+      <h2><span id="dayModalTitle"></span> <button class="close-x" id="closeDayModal">×</button></h2>
+      <div id="dayModalBody"></div>
+    </div>
+  </div>
+
+  <!-- 予定を追加モーダル -->
+  <div class="modal-bg" id="addSchedModalBg">
+    <div class="modal">
+      <h2>予定を追加 <button class="close-x" id="closeAddSchedModal">×</button></h2>
+      <label>日付</label>
+      <input type="date" id="schedDate">
+      <label>終了日（複数日にわたる場合。1日だけなら空欄でOK）</label>
+      <input type="date" id="schedEndDate">
+      <label>時刻（分かれば）</label>
+      <input type="text" id="schedTime" placeholder="例：9:00（空欄でも大丈夫です）">
+      <label>種類（自由に名前を決められます）</label>
+      <input type="text" id="schedCategory" placeholder="例：水やり、種まき、農協の集まり など">
+      <div id="schedCategoryChips"></div>
+      <label>予定の内容</label>
+      <input type="text" id="schedTitle" placeholder="例：畑の水やり、種まき、農協の集まり">
+      <label>メモ（あれば）</label>
+      <textarea id="schedNote" placeholder="場所や持ち物など、伝えたいことがあれば"></textarea>
+      <button class="btn wide" id="addSchedBtn" style="margin-top:12px;">予定を登録する</button>
+    </div>
+  </div>
+
+  <!-- お知らせ -->
+  <section class="view" id="view-announce">
+    <div class="card" id="announcePostCard" style="display:none;">
+      <h3>お知らせを配信する</h3>
+      <p class="hint">ここに書いた内容は、全員の画面に表示されます（管理者だけが配信できます）。</p>
+      <label>タイトル</label>
+      <input type="text" id="announceTitle" placeholder="例：〇月〇日はシステムメンテナンスのためお休みします">
+      <label>内容</label>
+      <textarea id="announceContent" placeholder="伝えたい内容を書いてください"></textarea>
+      <button class="btn wide sun" id="postAnnounceBtn" style="margin-top:12px;">配信する</button>
+    </div>
+    <div id="announceList"></div>
+  </section>
+
+  <!-- 広告 -->
+  <section class="view active" id="view-ads">
+    <div class="card">
+      <button class="btn wide sun" id="openAdPostModalBtn">＋ 広告を掲載する</button>
+    </div>
+
+    <div class="card" style="display:flex; gap:8px; flex-wrap:wrap;">
+      <button class="btn small outline ad-filter-btn sel" data-adfilter="all">すべて</button>
+      <button class="btn small outline ad-filter-btn" data-adfilter="farmer">農家</button>
+      <button class="btn small outline ad-filter-btn" data-adfilter="restaurant">飲食店</button>
+      <button class="btn small outline ad-filter-btn" data-adfilter="retailer">小売店</button>
+    </div>
+    <div id="adList"></div>
+  </section>
+
+  <!-- 広告を掲載するモーダル -->
+  <div class="modal-bg" id="adPostModalBg">
+    <div class="modal">
+      <h2>広告を掲載する <button class="close-x" id="closeAdPostModal">×</button></h2>
+      <p class="hint">農家・飲食店・小売店、それぞれの立場で広告を出せます。</p>
+      <label>あなたの立場</label>
+      <div class="type-choice" id="adTypeChoice">
+        <button data-at="farmer" class="sel">農家<br><span style="font-weight:normal; font-size:12px;">（売りたい）</span></button>
+        <button data-at="restaurant">飲食店<br><span style="font-weight:normal; font-size:12px;">（買いたい）</span></button>
+        <button data-at="retailer">小売店<br><span style="font-weight:normal; font-size:12px;">（売りたい）</span></button>
+      </div>
+      <div id="adTypeHint" class="hint"></div>
+
+      <label id="adProductLabel">商品名</label>
+      <input type="text" id="adProduct" placeholder="例：完熟トマト、堺の水なす">
+      <label id="adDescLabel">紹介文</label>
+      <textarea id="adDesc" placeholder="例：無農薬で育てました。5kg 2000円。ご興味あればご連絡ください。"></textarea>
+      <div id="adStockField">
+        <label>在庫数（あれば）</label>
+        <input type="number" id="adStock" min="0" placeholder="例：20（個・kgなど、紹介文に単位を書いてください）">
+      </div>
+      <div id="adDeliveryField">
+        <label>配達できる範囲（堺市内）</label>
+        <div id="adDeliveryWards" style="display:flex; flex-wrap:wrap; gap:6px;">
+          <button type="button" class="ward-chip" data-ward="堺区">堺区</button>
+          <button type="button" class="ward-chip" data-ward="中区">中区</button>
+          <button type="button" class="ward-chip" data-ward="東区">東区</button>
+          <button type="button" class="ward-chip" data-ward="西区">西区</button>
+          <button type="button" class="ward-chip" data-ward="南区">南区</button>
+          <button type="button" class="ward-chip" data-ward="北区">北区</button>
+          <button type="button" class="ward-chip" data-ward="美原区">美原区</button>
+        </div>
+        <label>配達についての補足（あれば）</label>
+        <input type="text" id="adDeliveryNote" placeholder="例：送料別途、○○円以上で配達無料 など">
+      </div>
+      <label>連絡先（電話番号やメールなど）</label>
+      <input type="text" id="adContact" placeholder="例：090-xxxx-xxxx">
+      <label>写真を添付（あれば）</label>
+      <input type="file" id="adImageInput" accept="image/*" multiple>
+      <p class="hint">写真は最大4枚まで対応しています。</p>
+      <div id="adImagePreviewBox"></div>
+      <label>動画を添付（1本まで）</label>
+      <input type="file" id="adVideoInput" accept="video/*">
+      <p class="hint">とても大きい動画は保存できないことがあります。その場合はエラーが表示されます。</p>
+      <div id="adVideoPreviewBox"></div>
+      <button class="btn wide sun" id="postAdBtn" style="margin-top:12px;">掲載する</button>
+    </div>
+  </div>
+
+  <!-- マイページ -->
+  <section class="view" id="view-mypage">
+    <div class="card" id="mypageLoginPromptCard" style="display:none;">
+      <h3>ログイン・新規登録</h3>
+      <p class="hint">投稿・いいね・広告の掲載・メッセージなど、参加するにはログイン（会員登録）が必要です。閲覧だけなら登録なしでもできます。</p>
+      <button class="btn wide sun" id="mypageGoLoginBtn">ログイン・新規登録する</button>
+    </div>
+    <div class="card" id="mypageAccountCard">
+      <h3><span id="mypageName"></span>さんのページ</h3>
+      <p id="mypageGuestNotice" class="hint" style="display:none;">ようこそ、ゲストさん</p>
+      <label>表示する名前</label>
+      <input type="text" id="mypageNameInput">
+      <button class="btn wide" id="mypageNameSaveBtn" style="margin-top:10px;">この名前に変更する</button>
+      <button class="btn wide outline" id="logoutBtn" style="display:none; margin-top:10px;">ログアウト</button>
+      <button class="btn wide outline" id="mypageOpenTermsBtn" style="margin-top:10px;">利用規約を見る</button>
+    </div>
+    <div class="card">
+      <button class="btn wide sun" id="mypageAdPostBtn">＋ 広告を掲載する</button>
+    </div>
+    <div class="card" id="mypageInboxCard">
+      <h3>あなたに届いたメッセージ</h3>
+      <p class="hint">広告を見た人から届いた、暗号化されたメッセージです。あなただけが読めます。</p>
+      <div id="inboxList"></div>
+    </div>
+    <div class="card" id="mypageMyPostsCard">
+      <h3>あなたの投稿</h3>
+      <div id="myPosts"></div>
+    </div>
+  </section>
+
+</main>
+</div>
+
+<button class="fab" id="newPostFab" title="広告を掲載する">＋</button>
+
+<!-- 投稿モーダル -->
+<div class="modal-bg" id="postModalBg">
+  <div class="modal">
+    <h2>投稿する <button class="close-x" id="closePostModal">×</button></h2>
+    <label>どの種類で投稿しますか？</label>
+    <div class="type-choice">
+      <button data-t="question" class="sel">質問・相談</button>
+      <button data-t="article">記事</button>
+    </div>
+    <div id="typeHint" class="hint"></div>
+
+    <label>カテゴリ</label>
+    <select id="postCategory">
+      <option>野菜</option><option>果樹</option><option>米・穀物</option>
+      <option>花・観賞植物</option><option>農機具</option><option>その他</option>
+    </select>
+
+    <label>タイトル（短くてOKです）</label>
+    <input type="text" id="postTitle" placeholder="例：トマトの葉が黄色くなってきました">
+
+    <label id="contentLabel">内容</label>
+    <textarea id="postContent" placeholder="いつから／何が起きているか／知りたいことなどを、思いついたままで大丈夫です"></textarea>
+
+    <label>写真を添付（あれば）</label>
+    <input type="file" id="postImageInput" accept="image/*" multiple>
+    <p class="hint">写真は最大4枚まで対応しています。</p>
+    <div id="postImagePreviewBox"></div>
+
+    <label>動画を添付（1本まで）</label>
+    <input type="file" id="postVideoInput" accept="video/*">
+    <p class="hint">とても大きい動画は保存できないことがあります。その場合はエラーが表示されます。</p>
+    <div id="postVideoPreviewBox"></div>
+
+    <button class="btn wide" id="submitPostBtn" style="margin-top:14px;">この内容で投稿する</button>
+  </div>
+</div>
+
+<!-- 詳細モーダル（質問・相談 / 記事の中身） -->
+<div class="modal-bg" id="detailModalBg">
+  <div class="modal">
+    <h2><span>投稿の詳細</span> <button class="close-x" id="closeDetailModal">×</button></h2>
+    <div id="detailBody"></div>
+  </div>
+</div>
+
+<!-- ダイレクトメッセージ作成モーダル -->
+<div class="modal-bg" id="dmModalBg">
+  <div class="modal">
+    <h2><span id="dmModalTitle">メッセージを送る</span> <button class="close-x" id="closeDmModal">×</button></h2>
+    <p class="hint">このメッセージは暗号化され、送信相手だけが読めます。短め（100文字程度まで）でお願いします。</p>
+    <div id="dmModalError"></div>
+    <label>メッセージ</label>
+    <textarea id="dmText" placeholder="例：広告を見ました。実物を見せていただけますか？"></textarea>
+    <button class="btn wide sun" id="dmSendBtn" style="margin-top:12px;">送信する</button>
+  </div>
+</div>
+
+<!-- 報告モーダル -->
+<div class="modal-bg" id="reportModalBg">
+  <div class="modal">
+    <h2>不適切な内容を報告 <button class="close-x" id="closeReportModal">×</button></h2>
+    <p class="hint">運営や他の利用者が気づけるよう、内容を報告できます。報告した相手には知らされません。</p>
+    <label>報告の理由</label>
+    <div class="type-choice" id="reportReasonChoice">
+      <button data-r="誹謗中傷・嫌がらせ" class="sel">誹謗中傷・<br>嫌がらせ</button>
+      <button data-r="スパム・宣伝">スパム・<br>宣伝</button>
+      <button data-r="不適切な内容">不適切な内容</button>
+      <button data-r="その他">その他</button>
+    </div>
+    <label>くわしい内容（あれば）</label>
+    <textarea id="reportNote" placeholder="どのような点が気になったか、簡単に教えてください"></textarea>
+    <button class="btn wide danger" id="reportSubmitBtn" style="margin-top:12px;">この内容で報告する</button>
+  </div>
+</div>
+
+<!-- 利用規約 -->
+<div class="modal-bg" id="termsModalBg">
+  <div class="modal">
+    <h2>利用規約 <button class="close-x" id="closeTermsModal">×</button></h2>
+    <div style="font-size:14px; line-height:1.9;">
+      <p>この利用規約（以下「本規約」）は、「堺市 みんなの農業ひろば」（以下「本サービス」）の利用条件を定めるものです。利用者は、本サービスを利用することで、本規約に同意したものとみなします。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第1条（本サービスの内容）</h3>
+      <p>本サービスは、堺市周辺の農業関係者・飲食店・小売店などが、質問・相談・記事の投稿、広告の掲載、メッセージのやり取り、予定の管理などを行うための場を、無償で提供するものです。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第2条（運営者の免責）</h3>
+      <p>本サービスの運営者（以下「運営者」）は、法令上許される最大限の範囲において、以下の事項について一切の責任を負いません。</p>
+      <ul style="padding-left:20px;">
+        <li>投稿・広告・メッセージなど、利用者が投稿した内容の真偽・正確性・合法性・品質</li>
+        <li>利用者間の取引（農作物や商品の売買、配達、代金の授受など）に関して生じたトラブル・損害</li>
+        <li>本サービスの利用によって利用者に生じたあらゆる直接的・間接的な損害</li>
+        <li>本サービスの中断、停止、終了、内容の変更によって生じた損害</li>
+        <li>通信障害、外部サービス（データベース・保存サービス等）の障害・仕様変更によるデータの消失・破損・漏えい</li>
+        <li>第三者による不正アクセス、なりすまし、投稿内容の改ざんなど</li>
+      </ul>
+      <p>運営者は、本サービスに事実上または法律上の瑕疵（安全性、信頼性、正確性、完全性、有効性、特定の目的への適合性、セキュリティなどに関する欠陥・エラーやバグ、権利侵害などを含みます）がないことを保証しません。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第3条（利用者の責任）</h3>
+      <p>利用者は、自己の責任において本サービスを利用するものとし、自らの投稿内容および利用者間のやり取りについて、自ら責任を負うものとします。利用者間で生じたトラブルは、利用者間で解決するものとし、運営者は一切関与しません。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第4条（禁止事項）</h3>
+      <p>利用者は、法令または公序良俗に違反する行為、他の利用者や第三者の権利を侵害する行為、虚偽の情報を投稿する行為、本サービスの運営を妨げる行為などを行ってはなりません。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第5条（投稿の削除等）</h3>
+      <p>運営者は、利用者への事前の通知なく、投稿の削除、利用停止、アカウントの削除等の措置を行うことができるものとし、これによって利用者に生じた損害について運営者は責任を負いません。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第6条（本サービスの変更・中断・終了）</h3>
+      <p>運営者は、利用者への事前の通知なく、本サービスの内容を変更し、または本サービスの提供を中断・終了することができるものとします。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第7条（規約の変更）</h3>
+      <p>運営者は、必要と判断した場合には、利用者への事前の通知なく本規約を変更できるものとします。変更後の規約は、本サービス上に表示した時点から効力を生じるものとします。</p>
+
+      <h3 style="font-size:15px; margin-top:16px;">第8条（準拠法・管轄）</h3>
+      <p>本規約の解釈にあたっては、日本法を準拠法とします。本サービスに関して紛争が生じた場合には、運営者の所在地を管轄する裁判所を専属的合意管轄とします。</p>
+
+    </div>
+    <button class="btn wide" id="closeTermsModalBtn" style="margin-top:16px;">閉じる</button>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // このアプリは、ご自身のSupabaseプロジェクト（無料）につなぐと、
+  // 投稿・広告などをみんなで共有できるようになります。
+  // 設定がまだ（またはうまくいかない）場合は、この端末だけに保存する簡易モードに自動で切り替えます。
+  let sbClient = null;
+
+  function initBackend(){
+    try{
+      const cfg = window.SAKAI_SUPABASE_CONFIG;
+      if(!cfg || !cfg.url || !cfg.key || cfg.key==='YOUR_ANON_PUBLIC_KEY') return false;
+      if(typeof supabase === 'undefined') return false;
+      sbClient = supabase.createClient(cfg.url, cfg.key);
+      return true;
+    }catch(e){
+      console.warn('Supabaseの初期化に失敗しました', e);
+      sbClient = null;
+      return false;
+    }
+  }
+
+  async function sGet(key, shared){
+    if(shared && sbClient){
+      try{
+        const { data, error } = await sbClient.from('kv_store').select('value').eq('key', key).maybeSingle();
+        if(error) throw error;
+        return data ? data.value : null;
+      }catch(e){ console.warn('読み込みに失敗しました:', key, e); return null; }
+    }
+    try{ const v = localStorage.getItem('sakai_local_'+key); return v ? JSON.parse(v) : null; }catch(e){ return null; }
+  }
+  async function sSet(key, val, shared){
+    if(shared && sbClient){
+      try{
+        const { error } = await sbClient.from('kv_store').upsert({ key, value: val });
+        if(error) throw error;
+        return true;
+      }catch(e){ console.warn('保存に失敗しました:', key, e); return null; }
+    }
+    try{ localStorage.setItem('sakai_local_'+key, JSON.stringify(val)); return {key, value:val}; }catch(e){ return null; }
+  }
+  async function sDelete(key, shared){
+    if(shared && sbClient){
+      try{ await sbClient.from('kv_store').delete().eq('key', key); }catch(e){ /* 無視 */ }
+    } else {
+      try{ localStorage.removeItem('sakai_local_'+key); }catch(e){}
+    }
+  }
+
+  const uid = () => Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+  const MAX_IMAGES = 4;
+
+  // ---------- 画像の縮小・圧縮（保存容量を抑えるため） ----------
+  // Blob を返します。プレビューは URL.createObjectURL で表示し、
+  // 実際のアップロードは投稿・掲載のタイミングでまとめて行います。
+  function compressImage(file, maxDim, quality){
+    return new Promise((resolve, reject)=>{
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('読み込みに失敗しました'));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('画像を読み込めませんでした'));
+        img.onload = () => {
+          let w = img.width, h = img.height;
+          if(w > h && w > maxDim){ h = Math.round(h * maxDim / w); w = maxDim; }
+          else if(h > maxDim){ w = Math.round(w * maxDim / h); h = maxDim; }
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          canvas.toBlob(blob=>{
+            if(blob) resolve(blob); else reject(new Error('画像の変換に失敗しました'));
+          }, 'image/jpeg', quality);
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 複数枚（最大4枚）の写真を選べる部品。onChangeArray には現在の Blob 配列を渡す
+  function wireMultiImagePicker(inputId, previewBoxId, onChangeArray){
+    let images = []; // Blob[]
+    function renderPreview(){
+      const box = document.getElementById(previewBoxId);
+      box.innerHTML = images.map((blob, i) =>
+        `<div class="img-preview-wrap"><img src="${URL.createObjectURL(blob)}"><button type="button" data-clearidx="${i}">×</button></div>`
+      ).join('');
+      box.querySelectorAll('[data-clearidx]').forEach(btn=>{
+        btn.onclick = ()=>{
+          images.splice(Number(btn.dataset.clearidx), 1);
+          onChangeArray(images.slice());
+          renderPreview();
+        };
+      });
+    }
+    document.getElementById(inputId).addEventListener('change', async (e)=>{
+      const files = Array.from(e.target.files||[]);
+      e.target.value = '';
+      if(files.length===0) return;
+      const room = MAX_IMAGES - images.length;
+      if(room<=0){ alert('写真は最大'+MAX_IMAGES+'枚までです。'); return; }
+      if(files.length>room){ alert('残り'+room+'枚まで追加できます。最初の'+room+'枚を追加します。'); }
+      const toAdd = files.slice(0, room);
+      for(const file of toAdd){
+        if(!file.type.startsWith('image/')){ continue; }
+        try{
+          const blob = await compressImage(file, 900, 0.6);
+          images.push(blob);
+        }catch(err){ /* skip failed file */ }
+      }
+      onChangeArray(images.slice());
+      renderPreview();
+    });
+    return () => { images = []; onChangeArray([]); renderPreview(); };
+  }
+  let postImages = [];
+  const resetPostImage = wireMultiImagePicker('postImageInput','postImagePreviewBox', v=>postImages=v);
+  let adImages = [];
+  const resetAdImage = wireMultiImagePicker('adImageInput','adImagePreviewBox', v=>adImages=v);
+
+  // ---------- 動画（1本まで） ----------
+  // 選んだ時点では Blob を手元に持つだけで、投稿・掲載のタイミングでアップロードします。
+  function wireVideoPicker(inputId, previewBoxId){
+    let videoBlob = null;
+    function renderPreview(){
+      const box = document.getElementById(previewBoxId);
+      if(!videoBlob){ box.innerHTML=''; return; }
+      box.innerHTML = `<div class="img-preview-wrap" style="width:160px; height:auto;">
+        <video src="${URL.createObjectURL(videoBlob)}" controls style="width:160px; border-radius:12px; display:block;"></video>
+        <button type="button" data-clearvid>×</button>
+      </div>`;
+      box.querySelector('[data-clearvid]').onclick = ()=>{ videoBlob=null; document.getElementById(inputId).value=''; renderPreview(); };
+    }
+    document.getElementById(inputId).addEventListener('change', (e)=>{
+      const file = e.target.files[0];
+      e.target.value = '';
+      if(!file) return;
+      if(!file.type.startsWith('video/')){ alert('動画ファイルを選んでください'); return; }
+      videoBlob = file;
+      renderPreview();
+    });
+    return {
+      get: () => videoBlob,
+      reset: () => { videoBlob = null; document.getElementById(inputId).value=''; renderPreview(); }
+    };
+  }
+  const postVideoPicker = wireVideoPicker('postVideoInput','postVideoPreviewBox');
+  const adVideoPicker = wireVideoPicker('adVideoInput','adVideoPreviewBox');
+
+  // 選んだ写真・動画をまとめてアップロードし、公開URLを返す（Cloudflare Workerを経由してR2に保存）
+  async function uploadToR2(blob, filename){
+    const cfg = window.SAKAI_R2_CONFIG;
+    if(!cfg || !cfg.uploadUrl || cfg.uploadUrl === 'YOUR_WORKER_URL') return null;
+    try{
+      const form = new FormData();
+      form.append('file', blob, filename || 'upload');
+      const res = await fetch(cfg.uploadUrl, { method:'POST', body: form });
+      if(!res.ok) return null;
+      const data = await res.json();
+      return data.url || null;
+    }catch(e){ console.warn('R2アップロードに失敗しました', e); return null; }
+  }
+  async function uploadImages(blobs){
+    if(!blobs || blobs.length===0) return [];
+    const urls = [];
+    for(const blob of blobs){
+      const url = await uploadToR2(blob, uid()+'.jpg');
+      if(url) urls.push(url);
+    }
+    return urls;
+  }
+  async function uploadVideo(blob){
+    if(!blob) return { url:null, error:null };
+    const ext = (blob.type && blob.type.split('/')[1]) || 'mp4';
+    const url = await uploadToR2(blob, uid()+'.'+ext);
+    return { url, error: url ? null : 'upload_failed' };
+  }
+
+
+  let profile = { username: null };
+  let posts = [];
+  let ads = [];
+  let crops = [];
+  let schedule = [];
+  let dailyRoutine = [];
+  let announcements = [];
+  let calMonth = new Date().getMonth();
+  let calYear = new Date().getFullYear();
+  let postType = "question";
+  let currentDetailId = null;
+
+  const typeHints = {
+    question: "分からないこと・困っていることを気軽に書いてください。詳しく書けなくても大丈夫です。",
+    article: "知っていることや経験を、他の人にも役立つ形で書いてみましょう。"
+  };
+  const contentLabels = { question:"質問・相談の内容", article:"記事の内容" };
+  const typeLabel = { question:['質問・相談','q'], article:['記事','a'] };
+
+  function renderStorageModeBanner(){
+    const box = document.getElementById('storageModeBanner');
+    if(sbClient){ box.innerHTML=''; return; }
+    box.innerHTML = `<div class="notice-limit" style="border-radius:0; margin-bottom:0;">
+      現在、この画面はみんなで共有するデータベースにつながっていません（この端末だけの保存になります）。
+      サイトの管理者の方は、ページ上部のSupabase設定に、ご自身のプロジェクトの情報を入力してください。
+    </div>`;
+  }
+
+  let authUser = null;
+
+  // 管理者かどうか。Supabaseの app_metadata.role は利用者本人が書き換えられないため、
+  // 管理者の指定はここ（管理者だけが操作できる場所）でのみ行えます。
+  function isAdmin(){
+    return !!(sbClient && authUser && authUser.app_metadata && authUser.app_metadata.role === 'admin');
+  }
+  // 削除できるのは「投稿した本人」または「管理者」だけ
+  function canModerate(author){
+    return isAdmin() || author === profile.username;
+  }
+  // ログインしていない「閲覧だけ」の人を判定します
+  function isGuestBrowsing(){
+    return !!(sbClient && !authUser);
+  }
+  // 投稿・いいね・メッセージなど、会員登録が必要な操作の前に呼びます。
+  // 未ログインならログイン画面へ案内し、falseを返します（呼び出し側は処理を中断してください）。
+  function requireLogin(msg){
+    if(isGuestBrowsing()){
+      alert(msg || 'この操作には、ログイン（会員登録）が必要です。');
+      showAuthScreen();
+      return false;
+    }
+    return true;
+  }
+  function delLabel(author, short){
+    if(author === profile.username) return short ? '削除' : 'この投稿を削除';
+    return short ? '削除（管理者）' : 'この投稿を削除（管理者）';
+  }
+
+  async function init(){
+    renderStorageModeBanner();
+    // 管理者の設定が反映されるよう、ログイン情報を最新の状態に更新します
+    if(sbClient && authUser){
+      try{ const { data } = await sbClient.auth.getUser(); if(data && data.user) authUser = data.user; }catch(e){ console.warn(e); }
+    }
+    profile = await sGet('profile', false) || { username: null };
+    if(!profile.username){
+      if(authUser && authUser.user_metadata && authUser.user_metadata.display_name){
+        profile.username = authUser.user_metadata.display_name;
+        profile.hasCustomName = true;
+      } else {
+        profile.username = "農家さん" + Math.floor(Math.random()*900+100);
+      }
+      await sSet('profile', profile, false);
+    }
+    crops = (await sGet('crops', false)) || [];
+    schedule = (await sGet('sakai_schedule', false)) || [];
+    dailyRoutine = (await sGet('sakai_daily_routine', false)) || [];
+    announcements = (await sGet('sakai_announcements', true)) || [];
+    posts = (await sGet('sakai_posts', true)) || [];
+    ads = (await sGet('sakai_ads', true)) || [];
+
+    renderUser();
+    await ensureKeys();
+    renderPosts();
+    renderCrops();
+    renderCalendar();
+    renderSchedList();
+    renderRoutineList();
+    renderAnnouncements();
+    renderAds();
+    renderMyPage();
+    renderInbox();
+  }
+
+  function showApp(){
+    document.getElementById('authScreen').style.display = 'none';
+    document.getElementById('appRoot').style.display = '';
+  }
+  function showAuthScreen(){
+    document.getElementById('authScreen').style.display = 'flex';
+    document.getElementById('appRoot').style.display = 'none';
+  }
+  document.getElementById('authBackToBrowseBtn').onclick = () => { showApp(); };
+  document.getElementById('mypageGoLoginBtn').onclick = () => { showAuthScreen(); };
+
+  let authMode = 'login';
+  function updateAuthTabs(){
+    document.getElementById('authTabLogin').classList.toggle('sel', authMode==='login');
+    document.getElementById('authTabSignup').classList.toggle('sel', authMode==='signup');
+    document.getElementById('authSignupNameField').style.display = authMode==='signup' ? '' : 'none';
+    document.getElementById('authTermsField').style.display = authMode==='signup' ? '' : 'none';
+    document.getElementById('authSubmitBtn').textContent = authMode==='signup' ? '新規登録する' : 'ログインする';
+    document.getElementById('authError').innerHTML = '';
+  }
+  document.getElementById('authTabLogin').onclick = () => { authMode='login'; updateAuthTabs(); };
+  document.getElementById('authTabSignup').onclick = () => { authMode='signup'; updateAuthTabs(); };
+
+  document.getElementById('authSubmitBtn').onclick = async () => {
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    const errBox = document.getElementById('authError');
+    errBox.innerHTML = '';
+    if(!email || !password){ errBox.innerHTML = '<div class="notice-limit">メールアドレスとパスワードを入力してください</div>'; return; }
+    const btn = document.getElementById('authSubmitBtn');
+    btn.disabled = true;
+    try{
+      if(authMode==='signup'){
+        const displayName = document.getElementById('authDisplayName').value.trim();
+        if(!displayName){ errBox.innerHTML = '<div class="notice-limit">表示する名前を入力してください</div>'; btn.disabled=false; return; }
+        if(!document.getElementById('authTermsCheck').checked){ errBox.innerHTML = '<div class="notice-limit">利用規約に同意していただく必要があります</div>'; btn.disabled=false; return; }
+        const { data, error } = await sbClient.auth.signUp({ email, password, options:{ data:{ display_name: displayName } } });
+        if(error) throw error;
+        if(data.session){
+          authUser = data.user;
+          showApp();
+          await init();
+        } else {
+          errBox.innerHTML = '<div class="notice-limit" style="background:#E7F0E9;border-color:#B9D9C0;color:#2C5A38;">確認メールを送信しました。メール内のリンクを開いてから、ログインしてください。</div>';
+        }
+      } else {
+        const { data, error } = await sbClient.auth.signInWithPassword({ email, password });
+        if(error) throw error;
+        authUser = data.user;
+        showApp();
+        await init();
+      }
+    }catch(e){
+      errBox.innerHTML = `<div class="notice-limit">${escapeHtml((e && e.message) || 'エラーが発生しました')}</div>`;
+    }
+    btn.disabled = false;
+  };
+
+  async function boot(){
+    const hasBackend = initBackend();
+    if(!hasBackend){
+      // Supabase未設定の場合は、これまで通りログインなしで使えるようにします
+      showApp();
+      await init();
+      return;
+    }
+    try{
+      const { data } = await sbClient.auth.getSession();
+      if(data && data.session && data.session.user){
+        authUser = data.session.user;
+      }
+    }catch(e){
+      console.warn('ログイン状態の確認に失敗しました', e);
+    }
+    // ログインしていなくても、まずは閲覧できるようにアプリを表示します
+    showApp();
+    await init();
+    sbClient.auth.onAuthStateChange(async (event, session) => {
+      if(event === 'SIGNED_IN' && session && session.user){
+        if(authUser) return; // すでに処理済み（初回ログイン時の二重初期化を防ぐ）
+        authUser = session.user;
+        showApp();
+        await init();
+      } else if(event === 'SIGNED_OUT'){
+        location.reload();
+      }
+    });
+  }
+
+  function renderUser(){
+    document.getElementById('userNameDisplay').textContent = "ようこそ、" + profile.username + "さん" + (isAdmin() ? "（管理者）" : "");
+  }
+  async function changeUsername(newName){
+    if(!newName || !newName.trim()) return;
+    profile.username = newName.trim();
+    profile.hasCustomName = true;
+    await sSet('profile', profile, false);
+    if(sbClient && authUser){
+      try{ await sbClient.auth.updateUser({ data: { display_name: profile.username } }); }catch(e){ console.warn('表示名の更新に失敗しました', e); }
+    }
+    renderUser(); renderMyPage();
+    await ensureKeys();
+  }
+  document.getElementById('mypageNameSaveBtn').onclick = () => {
+    const n = document.getElementById('mypageNameInput').value;
+    if(!n || !n.trim()){ alert('名前を入力してください'); return; }
+    changeUsername(n);
+  };
+  document.getElementById('logoutBtn').onclick = async () => {
+    if(!confirm('ログアウトしますか？')) return;
+    try{ await sbClient.auth.signOut(); }catch(e){ console.warn(e); }
+  };
+
+  // ---------- 暗号化ダイレクトメッセージ ----------
+  const CRYPTO_OK = (typeof crypto !== 'undefined' && crypto.subtle);
+  let myKeyPair = null;
+
+  function b64encode(buf){ return btoa(String.fromCharCode(...new Uint8Array(buf))); }
+  function b64decode(b64){
+    const bin = atob(b64); const arr = new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
+    return arr.buffer;
+  }
+
+  async function ensureKeys(){
+    if(!CRYPTO_OK || isGuestBrowsing()) return;
+    try{
+      let stored = await sGet('dm_keys', false);
+      if(stored && stored.privateJwk && stored.publicJwk){
+        myKeyPair = {
+          privateKey: await crypto.subtle.importKey('jwk', stored.privateJwk, {name:'RSA-OAEP', hash:'SHA-256'}, true, ['decrypt']),
+          publicKey: await crypto.subtle.importKey('jwk', stored.publicJwk, {name:'RSA-OAEP', hash:'SHA-256'}, true, ['encrypt'])
+        };
+      } else {
+        const kp = await crypto.subtle.generateKey({name:'RSA-OAEP', modulusLength:2048, publicExponent:new Uint8Array([1,0,1]), hash:'SHA-256'}, true, ['encrypt','decrypt']);
+        myKeyPair = kp;
+        const publicJwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+        const privateJwk = await crypto.subtle.exportKey('jwk', kp.privateKey);
+        await sSet('dm_keys', {publicJwk, privateJwk}, false);
+      }
+      const dir = (await sGet('sakai_pubkeys', true)) || {};
+      const myPubJwk = await crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
+      if(JSON.stringify(dir[profile.username]) !== JSON.stringify(myPubJwk)){
+        dir[profile.username] = myPubJwk;
+        await sSet('sakai_pubkeys', dir, true);
+      }
+    }catch(e){ console.warn('鍵の準備に失敗しました', e); }
+  }
+
+  let dmTarget = null;
+  function openDmModal(toUsername){
+    dmTarget = toUsername;
+    document.getElementById('dmModalTitle').textContent = toUsername + 'さんへメッセージを送る';
+    document.getElementById('dmText').value = '';
+    document.getElementById('dmModalError').innerHTML = '';
+    document.getElementById('dmModalBg').classList.add('active');
+  }
+  document.getElementById('closeDmModal').onclick = ()=>{ document.getElementById('dmModalBg').classList.remove('active'); };
+
+  // ---------- 不適切な内容の報告 ----------
+  let reportTarget = null; // { kind:'post'|'answer'|'ad', postId, ansId }
+  let reportReason = '誹謗中傷・嫌がらせ';
+  document.querySelectorAll('#reportReasonChoice button').forEach(b=>{
+    b.onclick = ()=>{
+      document.querySelectorAll('#reportReasonChoice button').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      reportReason = b.dataset.r;
+    };
+  });
+  function openReportModal(kind, postId, ansId){
+    reportTarget = { kind, postId, ansId };
+    reportReason = '誹謗中傷・嫌がらせ';
+    document.querySelectorAll('#reportReasonChoice button').forEach((x,i)=>x.classList.toggle('sel', i===0));
+    document.getElementById('reportNote').value = '';
+    document.getElementById('reportModalBg').classList.add('active');
+  }
+  function openReportModalForAd(adId){ openReportModal('ad', adId, null); }
+  document.getElementById('closeReportModal').onclick = ()=>{ document.getElementById('reportModalBg').classList.remove('active'); };
+
+  function openTermsModal(){ document.getElementById('termsModalBg').classList.add('active'); }
+  function closeTermsModal(){ document.getElementById('termsModalBg').classList.remove('active'); }
+  document.getElementById('openTermsFromAuth').onclick = openTermsModal;
+  document.getElementById('mypageOpenTermsBtn').onclick = openTermsModal;
+  document.getElementById('closeTermsModal').onclick = closeTermsModal;
+  document.getElementById('closeTermsModalBtn').onclick = closeTermsModal;
+  const AUTO_DELETE_THRESHOLD = 20; // 同じ理由の報告がこの件数に達したら自動削除
+
+  document.getElementById('reportSubmitBtn').onclick = async ()=>{
+    if(!requireLogin('報告には、ログイン（会員登録）が必要です。')) return;
+    if(!reportTarget) return;
+    const note = document.getElementById('reportNote').value.trim();
+    const reports = (await sGet('sakai_reports', true)) || [];
+    reports.push({ id: uid(), ...reportTarget, reason: reportReason, note, reporter: profile.username, timestamp: Date.now() });
+    await sSet('sakai_reports', reports, true);
+
+    let autoDeleted = false;
+
+    if(reportTarget.kind==='post'){
+      const p = posts.find(x=>x.id===reportTarget.postId);
+      if(p){
+        p.reportCount = (p.reportCount||0)+1;
+        p.reportsByReason = p.reportsByReason || {};
+        p.reportsByReason[reportReason] = (p.reportsByReason[reportReason]||0)+1;
+        if(p.reportsByReason[reportReason] >= AUTO_DELETE_THRESHOLD){
+          posts = posts.filter(x=>x.id!==p.id);
+          if(p.videoKey) sDelete(p.videoKey, true);
+          autoDeleted = true;
+        }
+        await sSet('sakai_posts', posts, true);
+        renderPosts();
+        renderMyPage();
+        if(autoDeleted){
+          const bg = document.getElementById('detailModalBg');
+          if(bg.classList.contains('active') && currentDetailId===p.id) bg.classList.remove('active');
+        } else if(currentDetailId===p.id){
+          renderDetail(p);
+        }
+      }
+    } else if(reportTarget.kind==='answer'){
+      const p = posts.find(x=>x.id===reportTarget.postId);
+      const a = p && (p.answers||[]).find(x=>x.id===reportTarget.ansId);
+      if(a){
+        a.reportCount = (a.reportCount||0)+1;
+        a.reportsByReason = a.reportsByReason || {};
+        a.reportsByReason[reportReason] = (a.reportsByReason[reportReason]||0)+1;
+        if(a.reportsByReason[reportReason] >= AUTO_DELETE_THRESHOLD){
+          p.answers = p.answers.filter(x=>x.id!==a.id);
+          autoDeleted = true;
+        }
+        await sSet('sakai_posts', posts, true);
+        renderDetail(p); renderPosts();
+      }
+    } else if(reportTarget.kind==='ad'){
+      const a = ads.find(x=>x.id===reportTarget.postId);
+      if(a){
+        a.reportCount = (a.reportCount||0)+1;
+        a.reportsByReason = a.reportsByReason || {};
+        a.reportsByReason[reportReason] = (a.reportsByReason[reportReason]||0)+1;
+        if(a.reportsByReason[reportReason] >= AUTO_DELETE_THRESHOLD){
+          ads = ads.filter(x=>x.id!==a.id);
+          if(a.videoKey) sDelete(a.videoKey, true);
+          autoDeleted = true;
+        }
+        await sSet('sakai_ads', ads, true);
+        renderAds();
+      }
+    }
+    document.getElementById('reportModalBg').classList.remove('active');
+    alert(autoDeleted
+      ? '報告を受け付けました。同じ理由の報告が一定数に達したため、この投稿は自動的に削除されました。'
+      : '報告を受け付けました。ご協力ありがとうございます。');
+  };
+
+  document.getElementById('dmSendBtn').onclick = async ()=>{
+    if(!requireLogin('メッセージの送信には、ログイン（会員登録）が必要です。')) return;
+    const errBox = document.getElementById('dmModalError');
+    errBox.innerHTML = '';
+    const text = document.getElementById('dmText').value.trim();
+    if(!text){ alert('メッセージを入力してください'); return; }
+    if(!CRYPTO_OK){
+      errBox.innerHTML = '<p class="hint">この端末・ブラウザでは暗号化メッセージが利用できません。</p>'; return;
+    }
+    try{
+      const dir = (await sGet('sakai_pubkeys', true)) || {};
+      const jwk = dir[dmTarget];
+      if(!jwk){
+        errBox.innerHTML = '<p class="hint">この方はまだメッセージを受け取る準備ができていません（相手がマイページを一度開くと準備されます）。</p>';
+        return;
+      }
+      const enc = new TextEncoder().encode(text);
+      if(enc.length > 190){
+        errBox.innerHTML = '<p class="hint">メッセージが長すぎます。もう少し短く（100文字程度まで）してください。</p>';
+        return;
+      }
+      const pubKey = await crypto.subtle.importKey('jwk', jwk, {name:'RSA-OAEP', hash:'SHA-256'}, true, ['encrypt']);
+      const cipherBuf = await crypto.subtle.encrypt({name:'RSA-OAEP'}, pubKey, enc);
+      const messages = (await sGet('sakai_messages', true)) || [];
+      messages.push({ id: uid(), to: dmTarget, from: profile.username, cipher: b64encode(cipherBuf), timestamp: Date.now() });
+      await sSet('sakai_messages', messages, true);
+      document.getElementById('dmModalBg').classList.remove('active');
+      alert('送信しました。相手のマイページに暗号化された状態で届きます。');
+    }catch(e){
+      console.warn(e);
+      errBox.innerHTML = '<p class="hint">送信に失敗しました。もう一度お試しください。</p>';
+    }
+  };
+
+  async function renderInbox(){
+    document.getElementById('mypageInboxCard').style.display = isGuestBrowsing() ? 'none' : '';
+    if(isGuestBrowsing()) return;
+    const box = document.getElementById('inboxList');
+    if(!CRYPTO_OK){ box.innerHTML = '<p class="hint">この端末・ブラウザではメッセージ機能が利用できません。</p>'; return; }
+    if(!myKeyPair){ box.innerHTML = '<p class="hint">準備中です。少し待ってから、もう一度マイページを開いてください。</p>'; return; }
+    const messages = (await sGet('sakai_messages', true)) || [];
+    const mine = messages.filter(m=>m.to===profile.username).sort((a,b)=>b.timestamp-a.timestamp);
+    if(mine.length===0){ box.innerHTML = '<p class="hint">届いたメッセージはまだありません。</p>'; return; }
+    const rendered = [];
+    for(const m of mine){
+      let text = '（復号できませんでした）';
+      try{
+        const plainBuf = await crypto.subtle.decrypt({name:'RSA-OAEP'}, myKeyPair.privateKey, b64decode(m.cipher));
+        text = new TextDecoder().decode(plainBuf);
+      }catch(e){ /* keep fallback text */ }
+      rendered.push(`<div class="answer"><div>${escapeHtml(text)}</div><div class="meta">${escapeHtml(m.from)}さんより・${fmtDate(m.timestamp)}</div></div>`);
+    }
+    box.innerHTML = rendered.join('');
+  }
+
+  let currentTab = 'ads';
+  document.getElementById('tabs').addEventListener('click', (e)=>{
+    const btn = e.target.closest('button[data-view]');
+    if(!btn) return;
+    currentTab = btn.dataset.view;
+    document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.remove('active'));
+    btn.classList.add('active');
+    document.querySelectorAll('section.view').forEach(s=>s.classList.remove('active'));
+    document.getElementById('view-'+btn.dataset.view).classList.add('active');
+    if(btn.dataset.view==='mypage'){ renderMyPage(); renderInbox(); }
+    if(btn.dataset.view==='ads') renderAds();
+    if(btn.dataset.view==='calendar') goToToday();
+    if(btn.dataset.view==='announce') markAnnouncementsSeen();
+    updateFab();
+  });
+
+  function updateFab(){
+    const fab = document.getElementById('newPostFab');
+    if(currentTab==='calendar'){ fab.title = '予定を追加する'; }
+    else if(currentTab==='ads'){ fab.title = '広告を掲載する'; }
+    else { fab.title = '投稿する'; }
+  }
+
+  function likeCount(arr){ return (arr||[]).length; }
+
+  let currentFilter = 'all';
+  document.querySelectorAll('.filter-btn').forEach(b=>{
+    b.onclick = ()=>{
+      document.querySelectorAll('.filter-btn').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      currentFilter = b.dataset.filter;
+      renderPosts();
+    };
+  });
+
+  function renderRanking(){
+    const box = document.getElementById('rankingBox');
+    const score = p => likeCount(p.likes) + (p.views||0);
+    const topQ = posts.filter(p=>p.type==='question').slice().sort((a,b)=>score(b)-score(a)).slice(0,3).filter(p=>score(p)>0);
+    const topA = posts.filter(p=>p.type==='article').slice().sort((a,b)=>score(b)-score(a)).slice(0,3).filter(p=>score(p)>0);
+    if(topQ.length===0 && topA.length===0){ box.innerHTML=''; return; }
+    function block(title, arr){
+      if(arr.length===0) return '';
+      return `<div class="rank-section"><h3>${title}</h3>` + arr.map((p,i)=>
+        `<div class="rank-card tap" data-open="${p.id}"><span class="rank-num">${i+1}</span><span class="rtitle">${escapeHtml(p.title)}</span>
+        <div class="meta">閲覧 ${p.views||0}／いいね ${likeCount(p.likes)}</div></div>`
+      ).join('') + `</div>`;
+    }
+    box.innerHTML = block('よく見られている質問・相談', topQ) + block('よく見られている記事', topA);
+    box.querySelectorAll('[data-open]').forEach(el=>{
+      el.onclick = ()=>openDetail(el.dataset.open);
+    });
+  }
+
+  function renderPosts(){
+    renderRanking();
+    const list = document.getElementById('postList');
+    let items = posts.slice().sort((a,b)=>b.timestamp-a.timestamp);
+    if(currentFilter!=='all') items = items.filter(p=>p.type===currentFilter);
+    if(items.length===0){
+      list.innerHTML = '<div class="empty-state">まだ投稿がありません。右下の＋ボタンから投稿してみましょう。</div>';
+      return;
+    }
+    list.innerHTML = items.map(p=>renderPostSummary(p)).join('');
+    attachListEvents();
+  }
+
+  function snippet(text){
+    const t = text.replace(/\n/g,' ');
+    return t.length>60 ? t.slice(0,60)+'…' : t;
+  }
+
+  function renderPostSummary(p){
+    const [label, cls] = typeLabel[p.type];
+    const liked = p.likes && p.likes.includes(profile.username);
+    const isMine = p.author===profile.username;
+    const warn = (p.reportCount||0)>=3 ? '<span class="warn-pill">複数の報告あり</span>' : '';
+    return `<div class="card tap" data-open="${p.id}">
+      <span class="pill ${cls}">${label}</span><span class="pill">${escapeHtml(p.category||'')}</span>${warn}
+      <h3 class="post-title">${escapeHtml(p.title)}</h3>
+      <div class="snippet">${escapeHtml(snippet(p.content))}</div>
+      ${renderImageGrid(p)}
+      ${videoPlaceholder(p)}
+      <div class="meta">${escapeHtml(p.author)}・${fmtDate(p.timestamp)}${p.type==='question' ? '・回答 '+((p.answers||[]).length)+'件' : ''}</div>
+      <div class="like-row">
+        <button class="like-btn ${liked?'liked':''}" data-like="${p.id}">👍 いいね ${likeCount(p.likes)}</button>
+        <span class="view-tag">閲覧 ${p.views||0}</span>
+        <button class="btn small outline" data-share="${p.id}">共有</button>
+        <button class="btn small outline" data-report="${p.id}">報告</button>
+        ${canModerate(p.author) ? `<button class="del-btn" data-del="${p.id}">${delLabel(p.author, true)}</button>` : ''}
+      </div>
+    </div>`;
+  }
+
+  function attachListEvents(){
+    document.querySelectorAll('#postList .card[data-open]').forEach(card=>{
+      card.addEventListener('click', (e)=>{
+        if(e.target.closest('[data-like]') || e.target.closest('[data-del]') || e.target.closest('[data-report]')) return;
+        openDetail(card.dataset.open);
+      });
+    });
+    document.querySelectorAll('#postList [data-like]').forEach(b=>{
+      b.onclick = (e)=>{ e.stopPropagation(); toggleLike(b.dataset.like, null); };
+    });
+    document.querySelectorAll('#postList [data-del]').forEach(b=>{
+      b.onclick = (e)=>{ e.stopPropagation(); deletePost(b.dataset.del); };
+    });
+    document.querySelectorAll('#postList [data-share]').forEach(b=>{
+      b.onclick = (e)=>{ e.stopPropagation(); sharePost(b.dataset.share); };
+    });
+    document.querySelectorAll('#postList [data-report]').forEach(b=>{
+      b.onclick = (e)=>{ e.stopPropagation(); openReportModal('post', b.dataset.report, null); };
+    });
+  }
+
+  async function sharePost(id){
+    const p = posts.find(x=>x.id===id);
+    if(!p) return;
+    const [label] = typeLabel[p.type];
+    const text = `【${label}】${p.title}\n\n${p.content}\n\n投稿者：${p.author}\n（堺市 みんなの農業ひろば より）`;
+    if(navigator.share){
+      try{ await navigator.share({ title: p.title, text }); return; }catch(e){ /* user cancelled or unsupported, fall through */ }
+    }
+    try{
+      await navigator.clipboard.writeText(text);
+      alert('この投稿の内容をコピーしました。LINEやメールなど、好きなアプリに貼り付けて他の端末に送ることができます。');
+    }catch(e){
+      prompt('下の内容をコピーして、他の端末やアプリに貼り付けてください', text);
+    }
+  }
+
+  async function deletePost(id){
+    const cur = posts.find(p=>p.id===id);
+    if(!cur || !canModerate(cur.author)){ alert('この投稿を削除する権限がありません。'); return; }
+    if(!confirm(isAdmin() && cur.author!==profile.username ? '管理者として、この投稿を削除しますか？削除すると元に戻せません。' : 'この投稿を削除しますか？削除すると元に戻せません。')) return;
+    // 他の人の最新の投稿を消してしまわないよう、削除の直前に最新の状態を読み込み直します
+    if(sbClient){ posts = (await sGet('sakai_posts', true)) || posts; }
+    const target = posts.find(p=>p.id===id);
+    posts = posts.filter(p=>p.id!==id);
+    await sSet('sakai_posts', posts, true);
+    if(target && target.videoKey) sDelete(target.videoKey, true);
+    renderPosts(); renderMyPage();
+    const bg = document.getElementById('detailModalBg');
+    if(bg.classList.contains('active') && currentDetailId===id){ bg.classList.remove('active'); }
+  }
+
+  async function openDetail(id){
+    const p = posts.find(x=>x.id===id);
+    if(!p) return;
+    currentDetailId = id;
+    p.views = (p.views||0) + 1;
+    await sSet('sakai_posts', posts, true);
+    renderDetail(p);
+    document.getElementById('detailModalBg').classList.add('active');
+    renderPosts();
+  }
+
+  function renderDetail(p){
+    const [label] = typeLabel[p.type];
+    const liked = p.likes && p.likes.includes(profile.username);
+    const isMine = p.author===profile.username;
+    const warn = (p.reportCount||0)>=3 ? '<span class="warn-pill">複数の報告あり</span>' : '';
+    const answersHtml = p.type==='question' ? (p.answers||[]).slice().sort((a,b)=>a.timestamp-b.timestamp).map(a=>{
+      const aliked = a.likes && a.likes.includes(profile.username);
+      const aMine = a.author===profile.username;
+      const awarn = (a.reportCount||0)>=3 ? '<span class="warn-pill">複数の報告あり</span>' : '';
+      return `<div class="answer">
+        ${awarn}
+        <div>${escapeHtml(a.content)}</div>
+        <div class="meta">${escapeHtml(a.author)}・${fmtDate(a.timestamp)}</div>
+        <div class="like-row">
+          <button class="like-btn ${aliked?'liked':''}" data-ansdet="${a.id}">👍 いいね ${likeCount(a.likes)}</button>
+          <button class="btn small outline" data-reportans="${a.id}">報告</button>
+          ${canModerate(a.author) ? `<button class="del-btn" data-delans="${a.id}">${delLabel(a.author, true)}</button>` : ''}
+        </div>
+      </div>`;
+    }).join('') : '';
+    const answerForm = p.type==='question' ? `
+      <div class="answer-form">
+        <label>回答する</label>
+        <textarea id="detailAnswerInput" placeholder="回答を入力してください"></textarea>
+        <button class="btn small" id="detailAnswerSubmit" style="margin-top:6px;">回答する</button>
+      </div>` : '';
+    document.getElementById('detailBody').innerHTML = `
+      <span class="pill">${label}</span><span class="pill">${escapeHtml(p.category||'')}</span>${warn}
+      <h3 class="post-title">${escapeHtml(p.title)}</h3>
+      <div>${escapeHtml(p.content).replace(/\n/g,'<br>')}</div>
+      ${renderImageGrid(p)}
+      ${videoPlaceholder(p)}
+      <div class="meta">${escapeHtml(p.author)}・${fmtDate(p.timestamp)}・閲覧 ${p.views||0}</div>
+      <div class="like-row">
+        <button class="like-btn ${liked?'liked':''}" id="detailLikeBtn">👍 いいね ${likeCount(p.likes)}</button>
+        <button class="btn small outline" id="detailShareBtn">共有</button>
+        <button class="btn small outline" id="detailReportBtn">報告</button>
+        ${canModerate(p.author) ? `<button class="del-btn" id="detailDelBtn">${delLabel(p.author, false)}</button>` : ''}
+      </div>
+      ${answersHtml}
+      ${answerForm}
+    `;
+    document.getElementById('detailLikeBtn').onclick = ()=>toggleLike(p.id, null, true);
+    document.getElementById('detailShareBtn').onclick = ()=>sharePost(p.id);
+    document.getElementById('detailReportBtn').onclick = ()=>openReportModal('post', p.id, null);
+    if(canModerate(p.author)) document.getElementById('detailDelBtn').onclick = ()=>deletePost(p.id);
+    document.querySelectorAll('[data-ansdet]').forEach(b=>{ b.onclick = ()=>toggleLike(p.id, b.dataset.ansdet, true); });
+    document.querySelectorAll('[data-delans]').forEach(b=>{ b.onclick = ()=>deleteAnswer(p.id, b.dataset.delans); });
+    document.querySelectorAll('[data-reportans]').forEach(b=>{ b.onclick = ()=>openReportModal('answer', p.id, b.dataset.reportans); });
+    const submitBtn = document.getElementById('detailAnswerSubmit');
+    if(submitBtn){
+      submitBtn.onclick = async ()=>{
+        if(!requireLogin('回答するには、ログイン（会員登録）が必要です。')) return;
+        const ta = document.getElementById('detailAnswerInput');
+        const content = ta.value.trim();
+        if(!content) return;
+        p.answers = p.answers || [];
+        p.answers.push({ id: uid(), content, author: profile.username, timestamp: Date.now(), likes: [], reportCount: 0 });
+        await sSet('sakai_posts', posts, true);
+        renderDetail(p); renderPosts();
+      };
+    }
+  }
+
+  async function deleteAnswer(postId, ansId){
+    const p0 = posts.find(x=>x.id===postId);
+    const a0 = p0 && (p0.answers||[]).find(a=>a.id===ansId);
+    if(!a0 || !canModerate(a0.author)){ alert('この回答を削除する権限がありません。'); return; }
+    if(!confirm(isAdmin() && a0.author!==profile.username ? '管理者として、この回答を削除しますか？' : 'この回答を削除しますか？')) return;
+    if(sbClient){ posts = (await sGet('sakai_posts', true)) || posts; }
+    const p = posts.find(x=>x.id===postId);
+    if(!p) return;
+    p.answers = (p.answers||[]).filter(a=>a.id!==ansId);
+    await sSet('sakai_posts', posts, true);
+    renderDetail(p); renderPosts();
+  }
+
+  document.getElementById('closeDetailModal').onclick = ()=>{
+    document.getElementById('detailModalBg').classList.remove('active');
+  };
+
+  async function toggleLike(postId, ansId, fromDetail){
+    if(!requireLogin('いいねには、ログイン（会員登録）が必要です。')) return;
+    const p = posts.find(x=>x.id===postId);
+    if(!p) return;
+    const target = ansId ? (p.answers||[]).find(a=>a.id===ansId) : p;
+    if(!target) return;
+    target.likes = target.likes || [];
+    const i = target.likes.indexOf(profile.username);
+    if(i>=0) target.likes.splice(i,1); else target.likes.push(profile.username);
+    await sSet('sakai_posts', posts, true);
+    renderPosts();
+    renderMyPage();
+    if(fromDetail) renderDetail(p);
+  }
+
+  const postModalBg = document.getElementById('postModalBg');
+  document.getElementById('newPostFab').onclick = ()=>{
+    if(currentTab==='calendar'){
+      document.getElementById('schedDate').value = document.getElementById('schedDate').value || new Date().toISOString().slice(0,10);
+      document.getElementById('addSchedModalBg').classList.add('active');
+    } else if(currentTab==='ads'){
+      if(!requireLogin('広告の掲載には、ログイン（会員登録）が必要です。')) return;
+      document.getElementById('adPostModalBg').classList.add('active');
+    } else {
+      if(!requireLogin('投稿には、ログイン（会員登録）が必要です。')) return;
+      postModalBg.classList.add('active');
+    }
+  };
+  document.getElementById('closeAddSchedModal').onclick = ()=>{ document.getElementById('addSchedModalBg').classList.remove('active'); };
+  document.getElementById('closePostModal').onclick = ()=>{ postModalBg.classList.remove('active'); };
+  document.querySelectorAll('.type-choice button').forEach(b=>{
+    b.onclick = ()=>{
+      document.querySelectorAll('.type-choice button').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      postType = b.dataset.t;
+      document.getElementById('typeHint').textContent = typeHints[postType];
+      document.getElementById('contentLabel').textContent = contentLabels[postType];
+    };
+  });
+  document.getElementById('typeHint').textContent = typeHints.question;
+
+  document.getElementById('submitPostBtn').onclick = async ()=>{
+    if(!requireLogin('投稿には、ログイン（会員登録）が必要です。')) return;
+    const title = document.getElementById('postTitle').value.trim();
+    const content = document.getElementById('postContent').value.trim();
+    const category = document.getElementById('postCategory').value;
+    if(!title || !content){ alert('タイトルと内容を入力してください'); return; }
+    const btn = document.getElementById('submitPostBtn');
+    btn.disabled = true; btn.textContent = '投稿中…';
+    let videoUrl = null;
+    const vidBlob = postVideoPicker.get();
+    if(vidBlob){
+      const { url, error } = await uploadVideo(vidBlob);
+      if(!url){
+        const msg = error==='unsupported_type'
+          ? 'この動画の形式には対応していません。MP4形式でお試しください。'
+          : '動画の保存に失敗しました。しばらくしてからもう一度お試しいただくか、動画なしで投稿してください。';
+        alert(msg);
+        btn.disabled = false; btn.textContent = 'この内容で投稿する';
+        return;
+      }
+      videoUrl = url;
+    }
+    const imageUrls = await uploadImages(postImages);
+    posts.push({ id: uid(), type: postType, category, title, content, images: imageUrls, videoUrl, author: profile.username, timestamp: Date.now(), likes: [], answers: [], views: 0, reportCount: 0 });
+    await sSet('sakai_posts', posts, true);
+    document.getElementById('postTitle').value='';
+    document.getElementById('postContent').value='';
+    resetPostImage();
+    postVideoPicker.reset();
+    btn.disabled = false; btn.textContent = 'この内容で投稿する';
+    postModalBg.classList.remove('active');
+    document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.remove('active'));
+    document.querySelector('nav.tabs button[data-view=board]').classList.add('active');
+    document.querySelectorAll('section.view').forEach(s=>s.classList.remove('active'));
+    document.getElementById('view-board').classList.add('active');
+    renderPosts();
+  };
+
+  function renderCrops(){
+    const box = document.getElementById('cropChips');
+    if(crops.length===0){ box.innerHTML = '<p class="hint">まだ作物が登録されていません。</p>'; return; }
+    box.innerHTML = crops.map(c=>`<span class="crop-chip">${escapeHtml(c.name)}<button data-id="${c.id}" class="delCrop">×</button></span>`).join('');
+    document.querySelectorAll('.delCrop').forEach(b=>{
+      b.onclick = async ()=>{
+        crops = crops.filter(c=>c.id!==b.dataset.id);
+        await sSet('crops', crops, false);
+        renderCrops();
+      };
+    });
+  }
+  document.getElementById('addCropBtn').onclick = async ()=>{
+    const name = document.getElementById('cropName').value.trim();
+    const note = document.getElementById('cropNote').value.trim();
+    if(!name) return;
+    crops.push({ id: uid(), name, note });
+    await sSet('crops', crops, false);
+    document.getElementById('cropName').value=''; document.getElementById('cropNote').value='';
+    renderCrops();
+  };
+
+  const CAT_PALETTE = ['#3F7A4E','#3E8FB0','#C6841C','#B4472B','#7A5AA8','#3E7FB0','#5C8A3A','#A85C9E','#4E7A9E','#9E6B3F'];
+  function catColor(key){
+    const s = String(key||'その他');
+    let h = 0;
+    for(let i=0;i<s.length;i++){ h = (h*31 + s.charCodeAt(i)) >>> 0; }
+    return CAT_PALETTE[h % CAT_PALETTE.length];
+  }
+  function knownCategories(){
+    const seen = new Set();
+    schedule.forEach(s=>{ if(s.category) seen.add(s.category); });
+    dailyRoutine.forEach(s=>{ if(s.category) seen.add(s.category); });
+    return Array.from(seen);
+  }
+  function wireCategoryPicker(inputId, chipsBoxId){
+    function renderChips(){
+      const known = knownCategories();
+      const box = document.getElementById(chipsBoxId);
+      if(!box) return;
+      if(known.length===0){ box.innerHTML=''; return; }
+      box.innerHTML = '<p class="hint" style="margin:6px 0 4px;">よく使う項目から選ぶ：</p>' + known.map(k=>
+        `<button type="button" class="cat-chip" style="border-color:${catColor(k)}; color:${catColor(k)};" data-catpick="${escapeHtml(k)}">${escapeHtml(k)}</button>`
+      ).join('');
+      box.querySelectorAll('[data-catpick]').forEach(b=>{
+        b.onclick = ()=>{ document.getElementById(inputId).value = b.dataset.catpick; };
+      });
+    }
+    renderChips();
+    return renderChips;
+  }
+
+  let dayModalDate = null;
+
+  function eventsOnDay(dateStr){
+    return schedule.filter(s => dateStr >= s.date && dateStr <= (s.endDate || s.date))
+      .sort((a,b)=> (a.date+String(a.time||'')+a.id).localeCompare(b.date+String(b.time||'')+b.id));
+  }
+
+  function renderCalendar(){
+    document.getElementById('calTitle').textContent = `${calYear}年 ${calMonth+1}月`;
+    const grid = document.getElementById('calGrid');
+    const dows = ['月','火','水','木','金','土','日'];
+    let html = dows.map((d,i)=>`<div class="dow ${i===5?'sat':''} ${i===6?'sun':''}">${d}</div>`).join('');
+    const first = new Date(calYear, calMonth, 1);
+    const startDow = (first.getDay() + 6) % 7; // 月曜始まり（0=月）
+    const daysInMonth = new Date(calYear, calMonth+1, 0).getDate();
+    const prevMonthDays = new Date(calYear, calMonth, 0).getDate();
+    const totalCells = Math.ceil((startDow + daysInMonth) / 7) * 7;
+    const today = new Date();
+
+    for(let i=0; i<totalCells; i++){
+      const dow = i % 7; // 0=月...6=日
+      let y=calYear, m=calMonth, d, outside=false;
+      if(i < startDow){
+        d = prevMonthDays - startDow + 1 + i;
+        m = calMonth - 1; if(m<0){ m=11; y--; }
+        outside = true;
+      } else if(i >= startDow + daysInMonth){
+        d = i - (startDow + daysInMonth) + 1;
+        m = calMonth + 1; if(m>11){ m=0; y++; }
+        outside = true;
+      } else {
+        d = i - startDow + 1;
+      }
+      const dateStr = `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      const dayEvents = outside ? [] : eventsOnDay(dateStr);
+      const isToday = !outside && today.getFullYear()===y && today.getMonth()===m && today.getDate()===d;
+      const shown = dayEvents.slice(0,3);
+      const badges = shown.map(ev=>{
+        const isStart = dateStr === ev.date;
+        const isEnd = dateStr === (ev.endDate || ev.date);
+        const isRowStart = dow===0;
+        const isRowEnd = dow===6;
+        const visualStart = isStart || isRowStart;
+        const visualEnd = isEnd || isRowEnd;
+        let segClass;
+        if(visualStart && visualEnd) segClass = 'seg-solo';
+        else if(visualStart) segClass = 'seg-start';
+        else if(visualEnd) segClass = 'seg-end';
+        else segClass = 'seg-mid';
+        const showText = isStart || isRowStart; // 開始日、または週の頭で続きが分かるようにタイトルを表示
+        return `<span class="cal-badge ${segClass}" style="background:${catColor(ev.category)}" title="${escapeHtml(ev.title)}">${showText ? escapeHtml(ev.title) : ''}</span>`;
+      }).join('');
+      const more = dayEvents.length>3 ? `<span class="cal-more">+${dayEvents.length-3}件</span>` : '';
+      const dateCls = (dow===5 ? 'sat' : (dow===6 ? 'sun' : ''));
+      const cellCls = [isToday?'today':'', outside?'outside':''].filter(Boolean).join(' ');
+      html += `<div class="cal-cell ${cellCls}" data-day="${dateStr}"><div class="d ${dateCls}">${d}</div><div class="cal-badges">${badges}${more}</div></div>`;
+    }
+    grid.innerHTML = html;
+    grid.querySelectorAll('.cal-cell[data-day]').forEach(cell=>{
+      cell.onclick = ()=>openDayModal(cell.dataset.day);
+    });
+    const legend = knownCategories();
+    document.getElementById('calLegend').innerHTML = legend.length===0 ? '' : legend.map(k=>
+      `<span class="li"><span class="sw" style="background:${catColor(k)}"></span>${escapeHtml(k)}</span>`
+    ).join('');
+    if(typeof refreshMainCatChips === 'function') refreshMainCatChips();
+  }
+
+  function openDayModal(dateStr){
+    dayModalDate = dateStr;
+    renderDayModal();
+    document.getElementById('dayModalBg').classList.add('active');
+  }
+  document.getElementById('closeDayModal').onclick = ()=>{
+    document.getElementById('dayModalBg').classList.remove('active');
+  };
+
+  function renderDayModal(){
+    const d = new Date(dayModalDate+'T00:00:00');
+    document.getElementById('dayModalTitle').textContent = `${d.getMonth()+1}月${d.getDate()}日の予定`;
+    const body = document.getElementById('dayModalBody');
+    body.innerHTML = `
+      <div id="dayModalTimeline"></div>
+      <h3 style="margin-top:16px;">この日に予定を追加</h3>
+      <label>終了日（複数日にわたる場合。1日だけなら空欄でOK）</label>
+      <input type="date" id="quickSchedEndDate">
+      <label>時刻（分かれば）</label>
+      <input type="text" id="quickSchedTime" placeholder="例：9:00（空欄でも大丈夫です）">
+      <label>種類（自由に名前を決められます）</label>
+      <input type="text" id="quickSchedCategory" placeholder="例：水やり、種まき、農協の集まり など">
+      <div id="quickSchedCategoryChips"></div>
+      <label>予定の内容</label>
+      <input type="text" id="quickSchedTitle" placeholder="例：畑の水やり、種まき、農協の集まり">
+      <label>メモ（あれば）</label>
+      <textarea id="quickSchedNote" placeholder="場所や持ち物など"></textarea>
+      <button class="btn wide" id="quickAddSchedBtn" style="margin-top:12px;">この日に登録する</button>
+    `;
+    renderTimelineInto(document.getElementById('dayModalTimeline'), timelineItemsForDay(dayModalDate), { emptyText:'この日の予定はまだありません。', showDelete:true });
+    wireCategoryPicker('quickSchedCategory','quickSchedCategoryChips');
+    document.getElementById('quickAddSchedBtn').onclick = async ()=>{
+      const endDate = document.getElementById('quickSchedEndDate').value || null;
+      const time = document.getElementById('quickSchedTime').value.trim();
+      const category = document.getElementById('quickSchedCategory').value.trim() || 'その他';
+      const title = document.getElementById('quickSchedTitle').value.trim();
+      const note = document.getElementById('quickSchedNote').value.trim();
+      if(!title){ alert('予定の内容を入力してください'); return; }
+      if(endDate && endDate < dayModalDate){ alert('終了日は開始日より後にしてください'); return; }
+      await addSchedule(dayModalDate, endDate, time, category, title, note);
+      renderDayModal();
+      if(typeof refreshMainCatChips === 'function') refreshMainCatChips();
+    };
+  }
+
+  async function addSchedule(date, endDate, time, category, title, note){
+    schedule.push({ id: uid(), date, endDate: endDate || null, time, category, title, note, author: profile.username });
+    await sSet('sakai_schedule', schedule, false);
+    renderCalendar(); renderSchedList();
+  }
+  async function deleteSchedule(id){
+    if(!confirm('この予定を削除しますか？')) return;
+    schedule = schedule.filter(s=>s.id!==id);
+    await sSet('sakai_schedule', schedule, false);
+    renderCalendar(); renderSchedList(); renderDayModal();
+    if(typeof refreshMainCatChips === 'function') refreshMainCatChips();
+  }
+
+  document.getElementById('prevMonthBtn').onclick = ()=>{
+    calMonth--; if(calMonth<0){calMonth=11; calYear--;}
+    renderCalendar(); renderSchedList();
+  };
+  document.getElementById('nextMonthBtn').onclick = ()=>{
+    calMonth++; if(calMonth>11){calMonth=0; calYear++;}
+    renderCalendar(); renderSchedList();
+  };
+  document.getElementById('todayBtn').onclick = goToToday;
+  function goToToday(){
+    const now = new Date();
+    calMonth = now.getMonth(); calYear = now.getFullYear();
+    renderCalendar(); renderSchedList();
+  }
+  const refreshMainCatChips = wireCategoryPicker('schedCategory','schedCategoryChips');
+  document.getElementById('addSchedBtn').onclick = async ()=>{
+    const date = document.getElementById('schedDate').value;
+    const endDate = document.getElementById('schedEndDate').value || null;
+    const time = document.getElementById('schedTime').value.trim();
+    const category = document.getElementById('schedCategory').value.trim() || 'その他';
+    const title = document.getElementById('schedTitle').value.trim();
+    const note = document.getElementById('schedNote').value.trim();
+    if(!date || !title){ alert('日付と内容を入力してください'); return; }
+    if(endDate && endDate < date){ alert('終了日は開始日より後にしてください'); return; }
+    await addSchedule(date, endDate, time, category, title, note);
+    document.getElementById('schedTitle').value='';
+    document.getElementById('schedNote').value='';
+    document.getElementById('schedEndDate').value='';
+    document.getElementById('schedCategory').value='';
+    document.getElementById('schedDate').value='';
+    refreshMainCatChips();
+    document.getElementById('addSchedModalBg').classList.remove('active');
+  };
+  function renderTimelineInto(container, items, opts){
+    opts = opts || {};
+    if(items.length===0){
+      container.innerHTML = `<p class="hint">${opts.emptyText || '予定はまだありません。'}</p>`;
+      return;
+    }
+    container.innerHTML = `<div class="timeline">${items.map(ev=>{
+      const delBtn = ev.isRoutine
+        ? `<button class="del-btn tl-del" data-delroutine="${ev.id}">毎日の予定から削除</button>`
+        : (opts.showDelete ? `<button class="del-btn tl-del" data-delsched="${ev.id}">削除</button>` : '');
+      const rangeText = !ev.isRoutine && ev.endDate && ev.endDate!==ev.date ? `${ev.date}〜${ev.endDate}` : '';
+      return `<div class="tl-item">
+        <div class="tl-time">${ev.time ? escapeHtml(ev.time) : '－'}</div>
+        <div class="tl-line"><span class="tl-dot" style="background:${catColor(ev.category)}"></span></div>
+        <div class="tl-content">
+          <div class="tl-title">${escapeHtml(ev.title)} ${ev.isRoutine ? '<span class="pill">毎日</span>' : ''}</div>
+          ${rangeText ? `<div class="tl-note">${rangeText}</div>` : ''}
+          ${ev.note ? `<div class="tl-note">${escapeHtml(ev.note)}</div>` : ''}
+          ${delBtn}
+        </div>
+      </div>`;
+    }).join('')}</div>`;
+    container.querySelectorAll('[data-delsched]').forEach(b=>{
+      b.onclick = ()=>deleteSchedule(b.dataset.delsched);
+    });
+    container.querySelectorAll('[data-delroutine]').forEach(b=>{
+      b.onclick = async ()=>{
+        if(!confirm('この毎日の予定を削除しますか？')) return;
+        dailyRoutine = dailyRoutine.filter(r=>r.id!==b.dataset.delroutine);
+        await sSet('sakai_daily_routine', dailyRoutine, false);
+        renderRoutineList();
+      };
+    });
+  }
+  function timelineItemsForDay(dateStr){
+    const routineItems = dailyRoutine.map(r=>({...r, isRoutine:true}));
+    const dayItems = eventsOnDay(dateStr);
+    return routineItems.concat(dayItems).sort((a,b)=>String(a.time||'99:99').localeCompare(String(b.time||'99:99')));
+  }
+  function renderTodayTimeline(){
+    const box = document.getElementById('todayTimeline');
+    if(!box) return;
+    const todayStr = new Date().toISOString().slice(0,10);
+    renderTimelineInto(box, timelineItemsForDay(todayStr), { emptyText:'今日の予定はまだありません。', showDelete:true });
+  }
+
+  function renderSchedList(){
+    renderTodayTimeline();
+    const list = document.getElementById('schedList');
+    const todayStr = new Date().toISOString().slice(0,10);
+    const items = schedule.filter(s=>(s.endDate||s.date)>=todayStr).sort((a,b)=> (a.date+((a.time||'99:99'))).localeCompare(b.date+((b.time||'99:99')))).slice(0,15);
+    if(items.length===0){ list.innerHTML = '<p class="hint">これからの予定はまだありません。</p>'; return; }
+    list.innerHTML = items.map(ev=>{
+      const d = new Date(ev.date+'T00:00:00');
+      const isRange = ev.endDate && ev.endDate!==ev.date;
+      const de = isRange ? new Date(ev.endDate+'T00:00:00') : null;
+      const dateLabel = isRange ? `${d.getMonth()+1}/${d.getDate()}〜${de.getMonth()+1}/${de.getDate()}` : `${d.getMonth()+1}/${d.getDate()}`;
+      return `<div class="ev-card" style="border-left-color:${catColor(ev.category)}">
+        <span class="pill" style="background:${catColor(ev.category)}22; color:${catColor(ev.category)};">${escapeHtml(ev.category)}</span>
+        <span class="ev-time">${dateLabel}${ev.time? '　'+escapeHtml(ev.time):''}</span>
+        <div class="ev-title">${escapeHtml(ev.title)}</div>
+        ${ev.note ? `<div>${escapeHtml(ev.note)}</div>` : ''}
+        <button class="del-btn" data-del="${ev.id}" style="margin-top:6px;">削除</button>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('[data-del]').forEach(b=>{
+      b.onclick = ()=>deleteSchedule(b.dataset.del);
+    });
+  }
+
+  const refreshRoutineCatChips = wireCategoryPicker('routineCategory','routineCategoryChips');
+  document.getElementById('addRoutineBtn').onclick = async ()=>{
+    const time = document.getElementById('routineTime').value.trim();
+    const category = document.getElementById('routineCategory').value.trim() || 'その他';
+    const title = document.getElementById('routineTitle').value.trim();
+    const note = document.getElementById('routineNote').value.trim();
+    if(!title){ alert('内容を入力してください'); return; }
+    dailyRoutine.push({ id: uid(), time, category, title, note });
+    await sSet('sakai_daily_routine', dailyRoutine, false);
+    document.getElementById('routineTime').value='';
+    document.getElementById('routineCategory').value='';
+    document.getElementById('routineTitle').value='';
+    document.getElementById('routineNote').value='';
+    refreshRoutineCatChips();
+    if(typeof refreshMainCatChips === 'function') refreshMainCatChips();
+    renderRoutineList();
+  };
+  function renderRoutineList(){
+    renderTodayTimeline();
+    if(document.getElementById('dayModalBg').classList.contains('active') && dayModalDate) renderDayModal();
+    const box = document.getElementById('routineList');
+    if(!box) return;
+    if(dailyRoutine.length===0){ box.innerHTML = '<p class="hint">まだ毎日の予定は登録されていません。</p>'; return; }
+    const items = dailyRoutine.slice().sort((a,b)=>String(a.time||'').localeCompare(String(b.time||'')));
+    box.innerHTML = items.map(ev=>`<div class="ev-card" style="border-left-color:${catColor(ev.category)}">
+      <span class="pill" style="background:${catColor(ev.category)}22; color:${catColor(ev.category)};">${escapeHtml(ev.category)}</span>
+      ${ev.time ? `<span class="ev-time">毎日 ${escapeHtml(ev.time)}</span>` : '<span class="ev-time">毎日</span>'}
+      <div class="ev-title">${escapeHtml(ev.title)}</div>
+      ${ev.note ? `<div>${escapeHtml(ev.note)}</div>` : ''}
+      <button class="del-btn" data-delroutine="${ev.id}" style="margin-top:6px;">削除</button>
+    </div>`).join('');
+    box.querySelectorAll('[data-delroutine]').forEach(b=>{
+      b.onclick = async ()=>{
+        if(!confirm('この毎日の予定を削除しますか？')) return;
+        dailyRoutine = dailyRoutine.filter(r=>r.id!==b.dataset.delroutine);
+        await sSet('sakai_daily_routine', dailyRoutine, false);
+        renderRoutineList();
+      };
+    });
+  }
+
+  const AD_TYPES = {
+    farmer:      { label:'農家',   color:'#3F7A4E', hint:'あなたの野菜を売りたいときに使ってください。', productLabel:'商品名', descLabel:'紹介文', productPh:'例：完熟トマト、堺の水なす', descPh:'例：無農薬で育てました。5kg 2000円。ご興味あればご連絡ください。' },
+    restaurant:  { label:'飲食店', color:'#C6841C', hint:'仕入れたい野菜を、お店として募集できます。', productLabel:'求めている野菜', descLabel:'希望する条件', productPh:'例：小ぶりのトマト、水なす', descPh:'例：週2回、5kg程度。地元産のものを探しています。価格はご相談。' },
+    retailer:    { label:'小売店', color:'#7A5AA8', hint:'地元の野菜を、お店として販売したいときに使ってください。', productLabel:'取り扱いたい野菜', descLabel:'紹介文', productPh:'例：堺市産の玉ねぎ', descPh:'例：地元野菜コーナーで販売します。仕入れ量など気軽にご相談ください。' }
+  };
+  let adType = 'farmer';
+  document.querySelectorAll('#adTypeChoice button').forEach(b=>{
+    b.onclick = ()=>{
+      document.querySelectorAll('#adTypeChoice button').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      adType = b.dataset.at;
+      applyAdTypeUI();
+    };
+  });
+  function applyAdTypeUI(){
+    const t = AD_TYPES[adType];
+    document.getElementById('adTypeHint').textContent = t.hint;
+    document.getElementById('adProductLabel').textContent = t.productLabel;
+    document.getElementById('adDescLabel').textContent = t.descLabel;
+    document.getElementById('adProduct').placeholder = t.productPh;
+    document.getElementById('adDesc').placeholder = t.descPh;
+    document.getElementById('adStockField').style.display = (adType==='farmer') ? '' : 'none';
+    document.getElementById('adDeliveryField').style.display = (adType==='farmer') ? '' : 'none';
+  }
+  applyAdTypeUI();
+
+  document.querySelectorAll('#adDeliveryWards .ward-chip').forEach(b=>{
+    b.onclick = ()=>{ b.classList.toggle('sel'); };
+  });
+  function getSelectedWards(){
+    return Array.from(document.querySelectorAll('#adDeliveryWards .ward-chip.sel')).map(b=>b.dataset.ward);
+  }
+  function setSelectedWards(wards){
+    const set = new Set(wards||[]);
+    document.querySelectorAll('#adDeliveryWards .ward-chip').forEach(b=>{
+      b.classList.toggle('sel', set.has(b.dataset.ward));
+    });
+  }
+
+  let adFilter = 'all';
+  document.querySelectorAll('.ad-filter-btn').forEach(b=>{
+    b.onclick = ()=>{
+      document.querySelectorAll('.ad-filter-btn').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      adFilter = b.dataset.adfilter;
+      renderAds();
+    };
+  });
+
+  function stockPill(a){
+    if(a.stock==null) return '';
+    if(a.stock<=0) return '<span class="warn-pill" style="background:#EFE6DA; color:#7A6B52;">売り切れ</span>';
+    return `<span class="pill" style="background:#3F7A4E22; color:#2C5A38;">在庫：${a.stock}</span>`;
+  }
+  function deliveryInfo(a){
+    if(a.adType!=='farmer' || (!a.deliveryWards || a.deliveryWards.length===0) && !a.deliveryNote) return '';
+    const wardsText = (a.deliveryWards && a.deliveryWards.length>0) ? a.deliveryWards.join('・') : '指定なし';
+    return `<div class="meta">配達できる範囲：${escapeHtml(wardsText)}${a.deliveryNote ? '／'+escapeHtml(a.deliveryNote) : ''}</div>`;
+  }
+  function stockManager(a){
+    if(a.adType!=='farmer' || a.author!==profile.username) return '';
+    return `<div class="stock-manager">
+      <label>在庫を管理</label>
+      <div class="like-row">
+        <button class="btn small outline" data-stockminus="${a.id}">－1</button>
+        <input type="number" min="0" style="width:80px;" id="stockInput-${a.id}" value="${a.stock==null?'':a.stock}" placeholder="未設定">
+        <button class="btn small outline" data-stockplus="${a.id}">＋1</button>
+        <button class="btn small" data-stockset="${a.id}">この数に更新</button>
+      </div>
+      <button class="btn small danger" data-stockzero="${a.id}" style="margin-top:6px;">売り切れにする</button>
+    </div>`;
+  }
+
+  async function deleteAd(id){
+    if(!isAdmin()){ alert('広告を削除できるのは管理者だけです。'); return; }
+    if(!confirm('管理者として、この広告を削除しますか？削除すると元に戻せません。')) return;
+    if(sbClient){ ads = (await sGet('sakai_ads', true)) || ads; }
+    ads = ads.filter(a=>a.id!==id);
+    await sSet('sakai_ads', ads, true);
+    renderAds();
+  }
+
+  // ---------- お知らせ（管理者が配信） ----------
+  const ANNOUNCE_SEEN_KEY = 'sakai_announce_seen_ts';
+  function lastSeenAnnounceTs(){
+    try{ return Number(localStorage.getItem(ANNOUNCE_SEEN_KEY) || 0); }catch(e){ return 0; }
+  }
+  function latestAnnounceTs(){
+    return announcements.reduce((max,a)=>Math.max(max, a.timestamp||0), 0);
+  }
+  function updateAnnounceDot(){
+    const hasUnseen = announcements.length>0 && latestAnnounceTs() > lastSeenAnnounceTs();
+    const dot = document.getElementById('announceDot');
+    if(dot) dot.style.display = hasUnseen ? '' : 'none';
+    renderAnnounceBanner(hasUnseen);
+  }
+  function renderAnnounceBanner(hasUnseen){
+    const box = document.getElementById('announceBanner');
+    if(!box) return;
+    if(!hasUnseen){ box.innerHTML=''; return; }
+    const latest = announcements.slice().sort((a,b)=>b.timestamp-a.timestamp)[0];
+    if(!latest){ box.innerHTML=''; return; }
+    box.innerHTML = `<div class="notice-limit" style="background:#FFF3D6; border-color:#F0DDA6; display:flex; justify-content:space-between; align-items:center; gap:10px; cursor:pointer;" id="announceBannerInner">
+      <span>📢 お知らせ：${escapeHtml(latest.title)}</span>
+      <button class="btn small outline" type="button">見る</button>
+    </div>`;
+    document.getElementById('announceBannerInner').onclick = ()=>{
+      document.querySelector('nav.tabs button[data-view="announce"]').click();
+    };
+  }
+  function markAnnouncementsSeen(){
+    try{ localStorage.setItem(ANNOUNCE_SEEN_KEY, String(latestAnnounceTs())); }catch(e){}
+    updateAnnounceDot();
+  }
+  function renderAnnouncements(){
+    document.getElementById('announcePostCard').style.display = isAdmin() ? '' : 'none';
+    const list = document.getElementById('announceList');
+    const items = announcements.slice().sort((a,b)=>b.timestamp-a.timestamp);
+    if(items.length===0){
+      list.innerHTML = '<div class="empty-state">まだお知らせはありません。</div>';
+    } else {
+      list.innerHTML = items.map(a=>`<div class="announce-card">
+        <div class="announce-title">${escapeHtml(a.title)}</div>
+        <div>${escapeHtml(a.content).replace(/\n/g,'<br>')}</div>
+        <div class="meta">${fmtDate(a.timestamp)}・${escapeHtml(a.author)}</div>
+        ${isAdmin() ? `<button class="del-btn" data-delannounce="${a.id}" style="margin-top:6px;">削除（管理者）</button>` : ''}
+      </div>`).join('');
+      list.querySelectorAll('[data-delannounce]').forEach(b=>{
+        b.onclick = async ()=>{
+          if(!isAdmin()) return;
+          if(!confirm('このお知らせを削除しますか？')) return;
+          if(sbClient){ announcements = (await sGet('sakai_announcements', true)) || announcements; }
+          announcements = announcements.filter(a=>a.id!==b.dataset.delannounce);
+          await sSet('sakai_announcements', announcements, true);
+          renderAnnouncements();
+          updateAnnounceDot();
+        };
+      });
+    }
+    updateAnnounceDot();
+  }
+  document.getElementById('postAnnounceBtn').onclick = async ()=>{
+    if(!requireLogin('お知らせの配信にはログインが必要です。')) return;
+    if(!isAdmin()){ alert('お知らせを配信できるのは管理者だけです。'); return; }
+    const title = document.getElementById('announceTitle').value.trim();
+    const content = document.getElementById('announceContent').value.trim();
+    if(!title || !content){ alert('タイトルと内容を入力してください'); return; }
+    if(sbClient){ announcements = (await sGet('sakai_announcements', true)) || announcements; }
+    announcements.push({ id: uid(), title, content, author: profile.username, timestamp: Date.now() });
+    await sSet('sakai_announcements', announcements, true);
+    document.getElementById('announceTitle').value='';
+    document.getElementById('announceContent').value='';
+    renderAnnouncements();
+  };
+
+  function renderAds(){
+    const list = document.getElementById('adList');
+    let items = ads.slice().reverse();
+    if(adFilter!=='all') items = items.filter(a=>(a.adType||'farmer')===adFilter);
+    if(items.length===0){ list.innerHTML = '<div class="empty-state">まだ広告がありません。</div>'; return; }
+    list.innerHTML = items.map(a=>{
+      const t = AD_TYPES[a.adType] || AD_TYPES.farmer;
+      const warn = (a.reportCount||0)>=3 ? '<span class="warn-pill">複数の報告あり</span>' : '';
+      return `<div class="card">
+      <span class="pill" style="background:${t.color}22; color:${t.color};">${t.label}</span>${stockPill(a)}${warn}
+      <h3 class="post-title">${escapeHtml(a.product)}</h3>
+      <div>${escapeHtml(a.desc).replace(/\n/g,'<br>')}</div>
+      ${renderImageGrid(a)}
+      ${videoPlaceholder(a)}
+      ${deliveryInfo(a)}
+      <div class="meta">連絡先：${escapeHtml(a.contact)}／出品者：${escapeHtml(a.author)}・${fmtDate(a.timestamp)}</div>
+      <div class="like-row">
+        ${a.author!==profile.username ? `<button class="btn small sun" data-dmto="${escapeHtml(a.author)}">この方にメッセージを送る</button>` : ''}
+        <button class="btn small outline" data-reportad="${a.id}">報告</button>
+        ${isAdmin() ? `<button class="del-btn" data-deletead="${a.id}">削除（管理者）</button>` : ''}
+      </div>
+      ${stockManager(a)}
+    </div>`;
+    }).join('');
+    list.querySelectorAll('[data-dmto]').forEach(b=>{
+      b.onclick = ()=>openDmModal(b.dataset.dmto);
+    });
+    list.querySelectorAll('[data-reportad]').forEach(b=>{
+      b.onclick = ()=>openReportModalForAd(b.dataset.reportad);
+    });
+    list.querySelectorAll('[data-deletead]').forEach(b=>{
+      b.onclick = ()=>deleteAd(b.dataset.deletead);
+    });
+    list.querySelectorAll('[data-stockminus]').forEach(b=>{
+      b.onclick = ()=>adjustStock(b.dataset.stockminus, -1);
+    });
+    list.querySelectorAll('[data-stockplus]').forEach(b=>{
+      b.onclick = ()=>adjustStock(b.dataset.stockplus, 1);
+    });
+    list.querySelectorAll('[data-stockzero]').forEach(b=>{
+      b.onclick = ()=>setStock(b.dataset.stockzero, 0);
+    });
+    list.querySelectorAll('[data-stockset]').forEach(b=>{
+      b.onclick = ()=>{
+        const id = b.dataset.stockset;
+        const input = document.getElementById('stockInput-'+id);
+        const v = parseInt(input.value, 10);
+        setStock(id, isNaN(v) ? 0 : Math.max(0, v));
+      };
+    });
+  }
+  async function adjustStock(id, delta){
+    const a = ads.find(x=>x.id===id);
+    if(!a) return;
+    const cur = a.stock==null ? 0 : a.stock;
+    await setStock(id, Math.max(0, cur + delta));
+  }
+  async function setStock(id, value){
+    const a = ads.find(x=>x.id===id);
+    if(!a) return;
+    a.stock = value;
+    await sSet('sakai_ads', ads, true);
+    renderAds();
+  }
+  document.getElementById('postAdBtn').onclick = async ()=>{
+    if(!requireLogin('広告の掲載には、ログイン（会員登録）が必要です。')) return;
+    const product = document.getElementById('adProduct').value.trim();
+    const desc = document.getElementById('adDesc').value.trim();
+    const contact = document.getElementById('adContact').value.trim();
+    if(!product || !desc || !contact){ alert('すべての項目を入力してください'); return; }
+    const stockRaw = document.getElementById('adStock').value.trim();
+    const stock = (adType==='farmer' && stockRaw!=='') ? Math.max(0, parseInt(stockRaw,10)||0) : null;
+    const deliveryWards = adType==='farmer' ? getSelectedWards() : [];
+    const deliveryNote = adType==='farmer' ? document.getElementById('adDeliveryNote').value.trim() : '';
+    const btn = document.getElementById('postAdBtn');
+    btn.disabled = true; btn.textContent = '掲載中…';
+    let videoUrl = null;
+    const vidBlob = adVideoPicker.get();
+    if(vidBlob){
+      const { url, error } = await uploadVideo(vidBlob);
+      if(!url){
+        const msg = error==='unsupported_type'
+          ? 'この動画の形式には対応していません。MP4形式でお試しください。'
+          : '動画の保存に失敗しました。しばらくしてからもう一度お試しいただくか、動画なしで掲載してください。';
+        alert(msg);
+        btn.disabled = false; btn.textContent = '掲載する';
+        return;
+      }
+      videoUrl = url;
+    }
+    const imageUrls = await uploadImages(adImages);
+    ads.push({ id: uid(), adType, product, desc, contact, stock, deliveryWards, deliveryNote, images: imageUrls, videoUrl, author: profile.username, timestamp: Date.now(), reportCount: 0 });
+    await sSet('sakai_ads', ads, true);
+    document.getElementById('adProduct').value=''; document.getElementById('adDesc').value=''; document.getElementById('adContact').value=''; document.getElementById('adStock').value=''; document.getElementById('adDeliveryNote').value='';
+    setSelectedWards([]);
+    resetAdImage();
+    adVideoPicker.reset();
+    btn.disabled = false; btn.textContent = '掲載する';
+    document.getElementById('adPostModalBg').classList.remove('active');
+    renderAds();
+  };
+
+  document.getElementById('openAdPostModalBtn').onclick = ()=>{ if(!requireLogin('広告の掲載には、ログイン（会員登録）が必要です。')) return; document.getElementById('adPostModalBg').classList.add('active'); };
+  document.getElementById('mypageAdPostBtn').onclick = ()=>{ document.getElementById('adPostModalBg').classList.add('active'); };
+  document.getElementById('closeAdPostModal').onclick = ()=>{ document.getElementById('adPostModalBg').classList.remove('active'); };
+
+  function renderMyPage(){
+    const guestBrowsing = isGuestBrowsing();
+    document.getElementById('mypageLoginPromptCard').style.display = guestBrowsing ? '' : 'none';
+    document.getElementById('mypageAccountCard').style.display = guestBrowsing ? 'none' : '';
+    document.getElementById('mypageAdPostBtn').style.display = guestBrowsing ? 'none' : '';
+    document.getElementById('mypageMyPostsCard').style.display = guestBrowsing ? 'none' : '';
+    if(guestBrowsing){ document.getElementById('myPosts').innerHTML=''; return; }
+    document.getElementById('mypageName').textContent = profile.username;
+    document.getElementById('mypageNameInput').value = profile.username;
+    document.getElementById('mypageGuestNotice').style.display = (profile.hasCustomName || authUser) ? 'none' : '';
+    document.getElementById('logoutBtn').style.display = (sbClient && authUser) ? '' : 'none';
+    const mine = posts.filter(p=>p.author===profile.username).sort((a,b)=>b.timestamp-a.timestamp);
+    const box = document.getElementById('myPosts');
+    if(mine.length===0){ box.innerHTML = '<p class="hint">まだ投稿がありません。</p>'; return; }
+    box.innerHTML = mine.map(p=>{
+      const [label] = typeLabel[p.type];
+      return `<div class="card tap" data-open="${p.id}"><span class="pill">${label}</span><h3 class="post-title">${escapeHtml(p.title)}</h3>
+      <div class="meta">閲覧 ${p.views||0}／いいね ${likeCount(p.likes)}件</div>
+      <button class="del-btn" data-del="${p.id}" style="margin-top:6px;">削除</button></div>`;
+    }).join('');
+    box.querySelectorAll('.card[data-open]').forEach(card=>{
+      card.addEventListener('click', (e)=>{
+        if(e.target.closest('[data-del]')) return;
+        openDetail(card.dataset.open);
+      });
+    });
+    box.querySelectorAll('[data-del]').forEach(b=>{
+      b.onclick = (e)=>{ e.stopPropagation(); deletePost(b.dataset.del); };
+    });
+  }
+
+  function fmtDate(ts){
+    const d = new Date(ts);
+    return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  }
+  function escapeHtml(s){
+    return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+  // 画像はURL（新方式）または過去互換のための data: URL（旧方式）に対応
+  function imagesOf(item){
+    return (item.images && item.images.length) ? item.images : (item.image ? [item.image] : []);
+  }
+  function renderImageGrid(item){
+    const imgs = imagesOf(item);
+    if(imgs.length===0) return '';
+    if(imgs.length===1) return `<img class="post-image" src="${imgs[0]}">`;
+    return `<div class="post-images">${imgs.map(src=>`<img src="${src}">`).join('')}</div>`;
+  }
+  function videoPlaceholder(item){
+    const url = item.videoUrl || (item.videoAssetId ? null : null);
+    if(url) return `<video class="post-image" src="${url}" controls style="width:100%; border-radius:12px; margin-top:8px; display:block;"></video>`;
+    return '';
+  }
+
+  boot();
+})();
+</script>
+</div>
+</body>
+</html>
