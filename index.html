@@ -20,12 +20,11 @@
       );
       alter table kv_store enable row level security;
 
-      -- 閲覧（読み取り）は登録なしでも誰でもできるようにする
+
       create policy "kv anyone can read" on kv_store
         for select using (true);
 
-      -- 書き込み（投稿・いいね・広告の掲載など）は、ログインしている人だけができるようにする
-      -- （ここが空欄だと、ログインしていない見知らぬ人でも書き換えができてしまいます）
+      
       create policy "kv only logged in can write" on kv_store
         for insert with check (auth.role() = 'authenticated');
       create policy "kv only logged in can update" on kv_store
